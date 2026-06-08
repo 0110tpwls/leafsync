@@ -45,16 +45,40 @@ export function applyOps(text, ops) {
     if (typeof op.i === "string") {
       out = out.slice(0, p) + op.i + out.slice(p);
     } else if (typeof op.d === "string") {
-      // Defensive: only delete if the doc actually has that text there.
+      // Only delete if the doc actually has that text there; otherwise the
+      // position drifted (wrong doc / stale base) and deleting would corrupt —
+      // skip rather than mangle.
       if (out.slice(p, p + op.d.length) === op.d) {
-        out = out.slice(0, p) + out.slice(p + op.d.length);
-      } else {
         out = out.slice(0, p) + out.slice(p + op.d.length);
       }
     }
     // { p } with neither i nor d is a retain/cursor — ignore for content.
   }
   return out;
+}
+
+/**
+ * Would `ops` apply CLEANLY to `text`? (Every insert position in range, every
+ * delete matching the text it claims to remove.) Used to disambiguate which doc
+ * a remote op belongs to when the broadcast carries no doc id — a clean apply is
+ * strong evidence it's the right doc; otherwise we re-join to resync.
+ */
+export function opApplies(text, ops) {
+  if (!Array.isArray(ops)) return false;
+  let out = text;
+  for (const op of ops) {
+    if (op == null) continue;
+    const p = op.p | 0;
+    if (typeof op.i === "string") {
+      if (p < 0 || p > out.length) return false;
+      out = out.slice(0, p) + op.i + out.slice(p);
+    } else if (typeof op.d === "string") {
+      if (p < 0 || p + op.d.length > out.length || out.slice(p, p + op.d.length) !== op.d) return false;
+      out = out.slice(0, p) + out.slice(p + op.d.length);
+    }
+    // comment {c,p,t} / retain {p}: no text constraint
+  }
+  return true;
 }
 
 /**

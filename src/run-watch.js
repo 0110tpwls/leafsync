@@ -26,7 +26,7 @@
 import path from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { buildReport, writeReport } from "./comments.js";
-import { applyOps, docText } from "./ot.js";
+import { applyOps, opApplies, docText } from "./ot.js";
 import { computeOps, detectCommentConflicts, submitOps, planReanchors } from "./writeback.js";
 import { EditEchoGuard, FsSyncGuard } from "./loopguard.js";
 import { stateDir } from "./config.js";
@@ -61,20 +61,29 @@ export async function runForegroundWatch({ root, cfg, args }) {
   await page.addInitScript(injectedHook);
   const cap = await attachCapture(context, page);
 
-  // Interval mode: simple periodic ZIP pull, no live socket.
+  // Interval mode: periodic full ZIP re-pull (no live socket). Overleaf's ZIP
+  // endpoint RATE-LIMITS frequent downloads (HTTP 500 on short intervals), so
+  // clamp to a sane minimum and point users at live mode for low latency.
   if (args.interval) {
+    const MIN = 30;
+    const secs = Math.max(MIN, args.interval | 0);
+    if ((args.interval | 0) < MIN) {
+      log(`--interval ${args.interval}s is too low (the ZIP endpoint rate-limits and 500s); clamped to ${MIN}s. For low-latency sync, drop --interval to use live mode.`);
+    }
+    const pull1 = () => pullProject({ page, cap, deployment: cfg.deployment, projectId: cfg.projectId, mirrorDir, stateDir: stateDir(root), force: args.force, log });
     await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-    let { docs } = await pullProject({ page, cap, deployment: cfg.deployment, projectId: cfg.projectId, mirrorDir, stateDir: stateDir(root), force: args.force, log });
-    log(`interval mode: re-pull every ${args.interval}s (Ctrl-C to stop)`);
+    let { docs } = await pull1();
+    await writeReport(stateDir(root), buildReport(docs, await fetchThreads(page, cfg.deployment, cfg.projectId)));
+    log(`interval mode: re-pull every ${secs}s (Ctrl-C to stop)`);
     setInterval(async () => {
       try {
-        ({ docs } = await pullProject({ page, cap, deployment: cfg.deployment, projectId: cfg.projectId, mirrorDir, stateDir: stateDir(root), force: args.force, log }));
-        await writeReport(stateDir(root), buildReport(docs, {}));
+        ({ docs } = await pull1());
+        await writeReport(stateDir(root), buildReport(docs, await fetchThreads(page, cfg.deployment, cfg.projectId)));
         log(`re-pulled ${docs.length} docs`);
       } catch (e) {
-        log(`pull error: ${e.message}`);
+        log(`pull error: ${e.message} — live mode (drop --interval) avoids the rate-limited ZIP endpoint`);
       }
-    }, args.interval * 1000);
+    }, secs * 1000);
     return keepAlive();
   }
 
@@ -114,6 +123,18 @@ export async function runForegroundWatch({ root, cfg, args }) {
   const { result: sync, manifest: nextManifest } = await reconcile({ mirrorDir, entries, manifest, force: args.force, log });
   await writeManifest(sd, nextManifest);
   const divergedPaths = new Set([...sync.kept, ...sync.conflicts.map((c) => c.path)]);
+  // Un-flag FALSE divergence whose only difference is trailing whitespace: the
+  // ZIP-written mirror often ends with a "\n" that joinDoc's canonical text
+  // lacks. Without this, OL→local would stay paused for docs nobody edited.
+  for (const d of docs) {
+    if (!divergedPaths.has(d.path)) continue;
+    const r = rmap.get(d.docId);
+    if (!r || !Array.isArray(r.lines)) continue;
+    const local = await readFile(path.join(mirrorDir, d.path), "utf8").catch(() => null);
+    if (local != null && local.replace(/\s+$/, "") === docText(r.lines).replace(/\s+$/, "")) {
+      divergedPaths.delete(d.path);
+    }
+  }
 
   const byId = new Map();
   for (const d of docs) {
@@ -129,7 +150,10 @@ export async function runForegroundWatch({ root, cfg, args }) {
     log(`⚠ ${p}: local copy differs from Overleaf — OL→local paused for it${push ? " (it will push when you next save it)" : "; run \`pull\` to reconcile, or use --push"}`);
   }
   const byPath = new Map([...byId.values()].map((d) => [d.abs, d]));
-  await writeReport(stateDir(root), buildReport([...byId.values()], {}));
+  // Comment report: fetch thread MESSAGES too (author/text), not just the
+  // anchors — otherwise every comment shows "(no thread messages captured)".
+  const threads0 = await fetchThreads(page, cfg.deployment, cfg.projectId);
+  await writeReport(stateDir(root), buildReport([...byId.values()], threads0));
   log(`watching ${byId.size} docs under ${mirrorDir} — ${push ? "PUSH ENABLED (local→Overleaf)" : "read-only (use --push to enable write-back)"}`);
 
   const echoGuard = new EditEchoGuard();
@@ -141,24 +165,53 @@ export async function runForegroundWatch({ root, cfg, args }) {
   let csrf = await getCsrf(page).catch(() => null);
   const folders = folderIdMap(project);
 
-  // OL -> local. Apply each incoming op to the in-memory base + the mirror file.
+  // OL -> local. Overleaf's otUpdateApplied broadcast carries the op + version
+  // but NO doc id (verified live), so we ROUTE BY VERSION: the op applied at
+  // version `v`, so the target is the tracked doc currently at `v`. Our own
+  // pushes already advanced their doc's version, so an echo of our edit matches
+  // no doc (belt-and-suspenders: shouldDropByOp also drops it).
+  const writeDoc = async (d) => {
+    fsGuard.markWrite(d.abs); // tell the watcher this write isn't a user edit
+    await mkdir(path.dirname(d.abs), { recursive: true });
+    await writeFile(d.abs, d.text, "utf8");
+  };
   cap.on("remoteEdit", async ({ docId, op, version }) => {
-    const d = byId.get(docId);
-    if (!d || !Array.isArray(op) || op.length === 0) return;
-    if (d.diverged) return; // local copy differs; don't clobber it with remote ops
-    if (echoGuard.shouldDrop(docId, op)) return; // our own write-back echo
-    try {
-      d.text = applyOps(d.text, op);
-      // Remote op applied AT `version` -> realtime is now version+1. Track it
-      // (never go backward) so our next push submits at the current version.
-      d.version = Math.max(d.version | 0, (typeof version === "number" ? version : (d.version | 0)) + 1);
-      fsGuard.markWrite(d.abs); // tell the watcher this write isn't a user edit
-      await mkdir(path.dirname(d.abs), { recursive: true });
-      await writeFile(d.abs, d.text, "utf8");
-      log(`OL→local: ${d.path} (${op.length} op → v${d.version})`);
-    } catch (e) {
-      log(`apply error on ${d.path}: ${e.message} — re-syncing`);
+    if (!Array.isArray(op) || op.length === 0) return; // ack form ([{v}]) — ignore
+    if (echoGuard.shouldDropByOp(op)) return; // our own write-back echo
+    const v = version | 0;
+    // Candidate docs: the one named (legacy 2-arg form) or every non-diverged doc
+    // sitting at version v.
+    let candidates;
+    if (docId && byId.has(docId)) candidates = [byId.get(docId)];
+    else candidates = [...byId.values()].filter((d) => !d.diverged && (d.version | 0) === v);
+    if (!candidates.length) return; // nothing at that version (echo, or untracked doc)
+
+    // Unambiguous + the op applies cleanly -> fast path: apply incrementally.
+    const appliable = candidates.filter((d) => opApplies(d.text, op));
+    if (appliable.length === 1) {
+      const d = appliable[0];
+      try {
+        d.text = applyOps(d.text, op);
+        d.version = Math.max(d.version | 0, v + 1); // applied at v -> now v+1
+        await writeDoc(d);
+        log(`OL→local: ${d.path} (${op.length} op → v${d.version})`);
+      } catch (e) {
+        log(`apply error on ${d.path}: ${e.message} — re-syncing`);
+        await resync(page, d, log);
+        await writeDoc(d).catch(() => {});
+      }
+      return;
+    }
+    // Ambiguous (version collision) or the op didn't apply cleanly anywhere ->
+    // re-join the candidate(s) and take Overleaf's canonical text. Safe: never
+    // mis-applies; only docs that actually changed get rewritten.
+    for (const d of candidates) {
+      const before = d.version | 0;
       await resync(page, d, log);
+      if ((d.version | 0) !== before) {
+        await writeDoc(d).catch(() => {});
+        log(`OL→local: ${d.path} re-synced → v${d.version}`);
+      }
     }
   });
 
@@ -167,6 +220,25 @@ export async function runForegroundWatch({ root, cfg, args }) {
   // the new doc gets the content; comments on the old doc don't carry over.)
   const watcher = await watchMirror(mirrorDir, fsGuard, async ({ type, path: fp, binary }) => {
     const rel = path.relative(mirrorDir, fp);
+
+    // --- local FOLDER delete -> delete the folder on Overleaf ---
+    // (deleting a folder fires unlink for each file PLUS unlinkDir for the dir;
+    // without handling unlinkDir, Overleaf keeps the now-empty folder.)
+    if (type === "unlinkDir") {
+      const fid = folders.map.get(rel);
+      if (!fid) return; // unknown/untracked (or already removed by a parent delete)
+      if (!push) { log(`local folder delete STAGED: ${rel}/ — run \`watch --push\``); return; }
+      try {
+        if (!csrf) csrf = await getCsrf(page);
+        await deleteEntity(page, base, pid, csrf, "folder", fid);
+        // drop the folder + any tracked descendants from local maps
+        for (const [p, f] of [...folders.map]) if (p === rel || p.startsWith(rel + "/")) { folders.map.delete(p); folderPathById.delete(f); }
+        for (const e of [...byId.values()]) if (e.path === rel || e.path.startsWith(rel + "/")) { byId.delete(e.docId); byPath.delete(e.abs); }
+        for (const b of [...binByPath.values()]) if (b.path === rel || b.path.startsWith(rel + "/")) { binByPath.delete(b.abs); binById.delete(b.fileId); }
+        log(`local→OL: deleted folder ${rel}/`);
+      } catch (e) { log(`folder delete error on ${rel}: ${e.message}`); }
+      return;
+    }
 
     // --- binary (figure/asset) sync ---
     if (binary) {
@@ -305,6 +377,9 @@ export async function runForegroundWatch({ root, cfg, args }) {
     const remap = (p) => newPath + p.slice(oldPath.length);
     for (const d of byId.values()) if (under(d.path)) { fsGuard.markWrite(d.abs); fsGuard.markWrite(path.join(mirrorDir, remap(d.path))); }
     for (const b of binByPath.values()) if (under(b.path)) { fsGuard.markWrite(b.abs); fsGuard.markWrite(path.join(mirrorDir, remap(b.path))); }
+    // guard the dirs themselves (chokidar fires unlinkDir/addDir on a dir move)
+    fsGuard.markWrite(path.join(mirrorDir, oldPath)); fsGuard.markWrite(path.join(mirrorDir, newPath));
+    for (const [p] of folders.map) if (under(p)) { fsGuard.markWrite(path.join(mirrorDir, p)); fsGuard.markWrite(path.join(mirrorDir, remap(p))); }
     await mkdir(path.dirname(path.join(mirrorDir, newPath)), { recursive: true });
     await rename(path.join(mirrorDir, oldPath), path.join(mirrorDir, newPath)).catch(() => {});
     for (const d of [...byId.values()]) if (under(d.path)) { byPath.delete(d.abs); d.path = remap(d.path); d.abs = path.join(mirrorDir, d.path); byPath.set(d.abs, d); }
@@ -405,6 +480,10 @@ export async function runForegroundWatch({ root, cfg, args }) {
     const folderPath = folderPathById.get(id);
     if (folderPath != null) {
       try {
+        // guard the dir + tracked subdirs so chokidar's unlinkDir storm doesn't
+        // echo back as a local→OL folder delete
+        fsGuard.markWrite(path.join(mirrorDir, folderPath));
+        for (const [p] of folders.map) if (p === folderPath || p.startsWith(folderPath + "/")) fsGuard.markWrite(path.join(mirrorDir, p));
         await rm(path.join(mirrorDir, folderPath), { recursive: true, force: true });
         for (const [p, fid] of [...folders.map]) {
           if (p === folderPath || p.startsWith(folderPath + "/")) { folders.map.delete(p); folderPathById.delete(fid); }
@@ -448,6 +527,23 @@ export async function runForegroundWatch({ root, cfg, args }) {
   process.on("SIGTERM", () => shutdown("SIGTERM")); // `stop` sends SIGTERM
   process.on("exit", () => { try { releaseLock && releaseLock(); } catch { /* ignore */ } });
   return keepAlive();
+}
+
+/** Fetch comment thread messages (author/text/resolved) from the threads endpoint. */
+async function fetchThreads(page, base, pid) {
+  return page
+    .evaluate(
+      async ({ url }) => {
+        try {
+          const r = await fetch(url, { credentials: "include" });
+          return r.ok ? await r.json() : {};
+        } catch {
+          return {};
+        }
+      },
+      { url: `${base}/project/${pid}/threads` }
+    )
+    .catch(() => ({}));
 }
 
 /** Refresh one doc's base text/version/ranges from Overleaf after an error. */

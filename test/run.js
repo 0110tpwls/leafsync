@@ -2,7 +2,7 @@
 // Run: node test/run.js
 import assert from "node:assert/strict";
 import { parseFrame, decodeApplyOtUpdate, decodeJoinDoc, findRanges } from "../src/socketio.js";
-import { offsetToLineCol, applyOps, opHitsRange, docText, sliceAt } from "../src/ot.js";
+import { offsetToLineCol, applyOps, opApplies, opHitsRange, docText, sliceAt } from "../src/ot.js";
 import { buildReport, extractComments } from "../src/comments.js";
 import { computeOps, detectCommentConflicts, planReanchors } from "../src/writeback.js";
 import { EditEchoGuard, FsSyncGuard } from "../src/loopguard.js";
@@ -317,6 +317,45 @@ t("parseDaemonCommand: ignores non-watch and non-cli processes", () => {
   assert.equal(parseDaemonCommand("/Applications/Foo.app watch --project-root /p"), null); // not cli.js
   assert.equal(parseDaemonCommand("node /a/src/cli.js watch"), null); // no project-root
   assert.equal(parseDaemonCommand(""), null);
+});
+
+// --- remote-edit decode: the three otUpdateApplied / applyOtUpdate shapes ---
+t("decodeApplyOtUpdate: client send [docId, {op,v}]", () => {
+  const d = decodeApplyOtUpdate(["doc1", { op: [{ i: "x", p: 2 }], v: 7 }]);
+  assert.equal(d.docId, "doc1");
+  assert.equal(d.version, 7);
+  assert.equal(d.op[0].i, "x");
+});
+t("decodeApplyOtUpdate: server broadcast [{op,v,meta}] (remote edit, NO doc id)", () => {
+  // verified live shape — routing must fall back to version, docId is undefined
+  const d = decodeApplyOtUpdate([{ op: [{ i: "ZZ", p: 0 }], v: 10, meta: { source: "P.x", user_id: "u" } }]);
+  assert.equal(d.docId, undefined);
+  assert.equal(d.version, 10);
+  assert.deepEqual(d.op, [{ i: "ZZ", p: 0 }]);
+  assert.equal(d.meta.source, "P.x");
+});
+t("decodeApplyOtUpdate: sender ack [{v}] decodes to an empty op (ignored upstream)", () => {
+  const d = decodeApplyOtUpdate([{ v: 11 }]);
+  assert.equal(d.version, 11);
+  assert.deepEqual(d.op, []);
+});
+
+// --- opApplies: which doc does a doc-id-less op belong to? ---
+t("opApplies: clean insert/delete vs out-of-range / mismatched delete", () => {
+  assert.equal(opApplies("hello", [{ i: "X", p: 5 }]), true); // insert at end ok
+  assert.equal(opApplies("hello", [{ i: "X", p: 99 }]), false); // OOB
+  assert.equal(opApplies("hello", [{ d: "lo", p: 3 }]), true); // matches "lo"
+  assert.equal(opApplies("hello", [{ d: "XX", p: 0 }]), false); // text isn't "XX"
+  assert.equal(opApplies("ab", [{ i: "Z", p: 0 }, { d: "a", p: 1 }]), true); // sequential
+});
+
+// --- echo guard: drop our own edit by op signature alone (broadcast omits docId) ---
+t("EditEchoGuard.shouldDropByOp drops our submitted op without a docId", () => {
+  const g = new EditEchoGuard({ now: () => 1000 });
+  g.markSubmitted("docA", [{ i: "hi", p: 0 }]);
+  assert.equal(g.shouldDropByOp([{ i: "hi", p: 0 }]), true); // first time -> drop
+  assert.equal(g.shouldDropByOp([{ i: "hi", p: 0 }]), false); // consumed
+  assert.equal(g.shouldDropByOp([{ i: "other", p: 0 }]), false);
 });
 
 console.log(`\n${pass} tests passed.`);

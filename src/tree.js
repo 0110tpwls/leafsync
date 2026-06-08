@@ -126,7 +126,9 @@ export async function createDoc(page, base, pid, csrf, name, parentFolderId) {
 
 export async function deleteEntity(page, base, pid, csrf, type, id) {
   const r = await api(page, base, csrf, "DELETE", `/project/${pid}/${type}/${id}`);
-  if (!r.ok && r.status !== 204) throw new Error(`delete ${type} ${id}: HTTP ${r.status}`);
+  // 404 = already gone (e.g. a parent-folder delete cascaded first) — that's the
+  // outcome we wanted, so treat it as success rather than a noisy error.
+  if (!r.ok && r.status !== 204 && r.status !== 404) throw new Error(`delete ${type} ${id}: HTTP ${r.status}`);
 }
 
 export async function renameEntity(page, base, pid, csrf, type, id, name) {

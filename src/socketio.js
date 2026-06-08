@@ -83,14 +83,31 @@ function safeJson(s) {
 }
 
 /**
- * Pull the OT op array out of an applyOtUpdate event's args.
- * args shape: [docId, { op, v }]  ->  { docId, op, version }
+ * Decode an applyOtUpdate / otUpdateApplied event's args into
+ * { docId, op, version, meta }. Three shapes occur on www.overleaf.com:
+ *
+ *   client SEND  applyOtUpdate : [docId, { op, v }]
+ *   server CAST  otUpdateApplied: [{ op, v, meta }]      (a REMOTE edit — note:
+ *                                                         NO doc id; route by v)
+ *   server ACK   otUpdateApplied: [{ v }]                (our own push confirmed;
+ *                                                         op absent)
+ *
+ * docId is undefined for the broadcast/ack forms (the frame omits it); callers
+ * route those by version. Verified live: a remote edit arrives as
+ * `[{"op":[…],"v":N,"meta":{source,user_id,ts}}]`.
  */
 export function decodeApplyOtUpdate(args) {
-  if (!Array.isArray(args) || args.length < 2) return null;
-  const [docId, payload] = args;
-  if (!payload || typeof payload !== "object") return null;
-  return { docId, op: payload.op || [], version: payload.v };
+  if (!Array.isArray(args) || args.length === 0) return null;
+  const [a, b] = args;
+  // two-arg form: [docId, {op,v}]
+  if (typeof a === "string" && b && typeof b === "object" && !Array.isArray(b)) {
+    return { docId: a, op: Array.isArray(b.op) ? b.op : [], version: b.v, meta: b.meta };
+  }
+  // single-object form: [{op?,v,meta?,doc?}] (broadcast or sender ack)
+  if (a && typeof a === "object" && !Array.isArray(a)) {
+    return { docId: a.doc || a.doc_id || undefined, op: Array.isArray(a.op) ? a.op : [], version: a.v, meta: a.meta };
+  }
+  return null;
 }
 
 /**

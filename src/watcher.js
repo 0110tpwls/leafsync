@@ -55,5 +55,11 @@ export async function watchMirror(mirrorDir, fsGuard, onChange, { ignoreInitial 
   w.on("add", handler("add"));
   w.on("change", handler("change"));
   w.on("unlink", handler("unlink"));
+  // Folder removal: chokidar emits unlinkDir (no extension to filter on). Without
+  // this the files inside get deleted on Overleaf but the now-empty folder stays.
+  w.on("unlinkDir", (dirPath) => {
+    if (fsGuard && fsGuard.isOwnWrite(dirPath)) return; // our own OL→local removal
+    onChange({ type: "unlinkDir", path: dirPath, binary: false });
+  });
   return w;
 }

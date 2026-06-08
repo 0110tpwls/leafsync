@@ -13,17 +13,21 @@ export class EditEchoGuard {
   constructor({ ttl = DEFAULT_TTL, now = () => Date.now() } = {}) {
     this.ttl = ttl;
     this.now = now;
-    this.recent = new Map(); // sig -> expiry
+    this.recent = new Map(); // docId#op sig -> expiry
+    this.recentOps = new Map(); // op-only sig -> expiry (broadcast echoes omit docId)
   }
-  static sig(docId, op) {
-    // op signature stable across the echo: docId + ordered (i/d,p) tuples.
-    const ops = (op || [])
+  static opSig(op) {
+    return (op || [])
       .map((o) => (o.i != null ? `i${o.p}:${o.i}` : o.d != null ? `d${o.p}:${o.d}` : `r${o.p}`))
       .join("|");
-    return `${docId}#${ops}`;
+  }
+  static sig(docId, op) {
+    return `${docId}#${EditEchoGuard.opSig(op)}`;
   }
   markSubmitted(docId, op) {
-    this.recent.set(EditEchoGuard.sig(docId, op), this.now() + this.ttl);
+    const exp = this.now() + this.ttl;
+    this.recent.set(EditEchoGuard.sig(docId, op), exp);
+    this.recentOps.set(EditEchoGuard.opSig(op), exp);
   }
   /** True if this inbound edit is our own echo and should be dropped. */
   shouldDrop(docId, op) {
@@ -35,9 +39,23 @@ export class EditEchoGuard {
     }
     return false;
   }
+  /**
+   * docId-independent echo check: the otUpdateApplied broadcast carries no doc
+   * id, so match our own just-submitted op by its op signature alone.
+   */
+  shouldDropByOp(op) {
+    this._sweep();
+    const s = EditEchoGuard.opSig(op);
+    if (this.recentOps.has(s)) {
+      this.recentOps.delete(s);
+      return true;
+    }
+    return false;
+  }
   _sweep() {
     const t = this.now();
     for (const [k, exp] of this.recent) if (exp < t) this.recent.delete(k);
+    for (const [k, exp] of this.recentOps) if (exp < t) this.recentOps.delete(k);
   }
 }
 
