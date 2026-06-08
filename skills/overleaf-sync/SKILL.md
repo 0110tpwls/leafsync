@@ -49,7 +49,9 @@ node "$CLI" <command> [options] --project-root "$(pwd)"
 | `pull [--force]` | Mirrors the Overleaf project to the local folder **and** writes the comment report. Read-only toward Overleaf. **Safe by default:** a baseline manifest (`.overleaf/manifest.json`) lets it 3-way reconcile like `git pull` — files you didn't touch fast-forward, your **local edits are kept** (never silently overwritten), and a file changed on *both* sides is a **conflict**: your copy stays and Overleaf's lands as `<file>.overleaf-incoming`. `--force` takes Overleaf's version wholesale. |
 | `comments` | Refreshes just the comment report (`.overleaf/COMMENTS.md` + `comments.json`). |
 | `watch [--push] [--background] [--interval N] [--headful]` | Live sync (loop-guarded). **OL→local is on and solid.** **local→Overleaf write-back is opt-in via `--push`** — validated end-to-end on a throwaway project (clean single-op append, correct version tracking, no loop) but still **experimental** on real projects; default is read-only. In live mode the base text comes from `joinDoc` (not the ZIP) and is reconciled against the manifest, so a diverged local file is flagged and OL→local is paused for it until a save pushes it. See **Sync modes**. |
-| `status` / `stop` | Background-daemon state / stop it. |
+| `status` / `stop` | Background-daemon state for this project / stop it. |
+| `stop --ls` | List **all** running leafsync watch daemons on the machine (every project), with each one's pid, uptime, push-vs-read-only, project id/URL, and folder. Use this to find orphans left by crashed sessions. |
+| `stop --rm <pid> [<pid> …]` | Gracefully stop the chosen daemon(s) by pid (`--rm all` stops every one). SIGTERM first so each closes its Chromium + releases its lock, SIGKILL fallback, and clears the stale pid file. Only ever acts on processes confirmed to be leafsync daemons. |
 | `unlink` | Forget the saved session + config for this project. |
 
 After `pull`/`comments`, **Read `.overleaf/COMMENTS.md`** and present the open
@@ -156,6 +158,13 @@ Comment ranges are fetched by sending `joinDoc` over the app's own socket (via t
 - Always run with `--project-root "$(pwd)"` so state is scoped to the user's project.
 - For `link`, you must ask the user for the project URL; never guess it.
 - If a command reports an expired session, tell the user to re-run `link`.
+- **Removing daemons safely:** to stop background daemons, first run `stop --ls`
+  (no `--project-root` needed — it scans the whole machine) and **present the list
+  to the user**, calling out any in **PUSH** mode (those write to Overleaf) and any
+  on a project they may not have meant to leave running. Let the **user choose**
+  which to stop (e.g. via AskUserQuestion), then run `stop --rm <pid> …` with their
+  selection. Never `--rm all` or stop a daemon on the user's behalf without an
+  explicit choice — a daemon may be one they intentionally left running.
 - Treat `.overleaf/` as secret; never print `storageState.json` contents.
 - leafsync is its own opt-in plugin/program (Node + Playwright); it is independent
   of latex-sentinel. Run `./setup.sh` once before any live command.

@@ -11,6 +11,7 @@ import { processProjectStructure } from "../src/mirror.js";
 import { unzip, stripCommonRoot } from "../src/unzip.js";
 import { reconcile, sha256 } from "../src/reconcile.js";
 import { ensureParentFolder } from "../src/tree.js";
+import { parseDaemonCommand } from "../src/daemons.js";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -289,5 +290,33 @@ await (async () => {
     assert.ok(folders2.map.get("figures/experiments"));
   });
 })();
+
+// --- daemon discovery: identify our own watch processes from a ps command line ---
+t("parseDaemonCommand: a leafsync watch daemon (project-root last)", () => {
+  const cmd = "/usr/bin/node /Users/x/leafsync/src/cli.js watch --push --project-root /Users/x/paper";
+  const d = parseDaemonCommand(cmd);
+  assert.equal(d.projectRoot, "/Users/x/paper");
+  assert.equal(d.push, true);
+  assert.equal(d.interval, null);
+});
+t("parseDaemonCommand: interval + project-root followed by another flag", () => {
+  const cmd = "node /opt/leafsync/src/cli.js watch --interval 120 --project-root /home/u/my paper --mirror sub";
+  const d = parseDaemonCommand(cmd);
+  assert.equal(d.projectRoot, "/home/u/my paper"); // tolerate spaces, stop at --mirror
+  assert.equal(d.interval, 120);
+  assert.equal(d.push, false);
+});
+t("parseDaemonCommand: read-only daemon (no --push)", () => {
+  const d = parseDaemonCommand("node /a/src/cli.js watch --project-root /p");
+  assert.equal(d.push, false);
+  assert.equal(d.projectRoot, "/p");
+});
+t("parseDaemonCommand: ignores non-watch and non-cli processes", () => {
+  assert.equal(parseDaemonCommand("node /a/src/cli.js stop --ls"), null); // not watch
+  assert.equal(parseDaemonCommand("node /a/src/cli.js pull --project-root /p"), null);
+  assert.equal(parseDaemonCommand("/Applications/Foo.app watch --project-root /p"), null); // not cli.js
+  assert.equal(parseDaemonCommand("node /a/src/cli.js watch"), null); // no project-root
+  assert.equal(parseDaemonCommand(""), null);
+});
 
 console.log(`\n${pass} tests passed.`);

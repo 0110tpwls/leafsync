@@ -14,6 +14,7 @@ import { buildReport, writeReport } from "./comments.js";
 import {
   readDaemon, isAlive, spawnBackground, stopDaemon, clearLock,
 } from "./daemon.js";
+import { discoverDaemons, killDaemon } from "./daemons.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const HELP = `leafsync — two-way sync + comment mirror for Overleaf (write-back is experimental)
@@ -26,7 +27,9 @@ Usage:
   leafsync comments               refresh the local comment report only
   leafsync watch [opts]           live two-way sync (loop-guarded)
   leafsync status                 daemon state / last sync
-  leafsync stop                   stop a background watch daemon
+  leafsync stop                   stop the background daemon for --project-root
+  leafsync stop --ls              list ALL running watch daemons (every project)
+  leafsync stop --rm <pid|all>    stop chosen daemon(s) by pid (graceful)
   leafsync unlink                 forget session + config for this project
 
 watch options:
@@ -51,7 +54,7 @@ function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--background" || a === "--headful" || a === "--force" || a === "--push") args[a.slice(2)] = true;
+    if (a === "--background" || a === "--headful" || a === "--force" || a === "--push" || a === "--ls" || a === "--rm") args[a.slice(2)] = true;
     else if (a === "--debug-frames") args.debugFrames = true;
     else if (a === "--verbose" || a === "-v") args.verbose = true;
     else if (a === "--interval") args.interval = Number(argv[++i]);
@@ -261,9 +264,57 @@ async function lastLogLine(p) {
   }
 }
 
-async function cmdStop(root) {
+async function cmdStop(root, args) {
+  if (args.ls) return listDaemons();
+  if (args.rm) return removeDaemons(args._.slice(1)); // selectors are positional after "stop"
+  // default: stop the background daemon for this project root
   const r = await stopDaemon(root);
   console.log(r.stopped ? `stopped daemon (pid ${r.pid}).` : `nothing to stop: ${r.reason}.`);
+}
+
+function printDaemon(d) {
+  const mode = d.push ? "PUSH (writes Overleaf)" : "read-only";
+  const iv = d.interval ? `, interval ${d.interval}s` : "";
+  console.log(`  pid ${d.pid}  up ${d.etime || "?"}  ${d.push ? "⚠ " : ""}${mode}${iv}`);
+  console.log(`      project: ${d.projectId || "(unknown)"}${d.projectUrl ? `  ${d.projectUrl}` : ""}`);
+  console.log(`      folder:  ${d.projectRoot}`);
+}
+
+async function listDaemons() {
+  const { supported, daemons } = await discoverDaemons();
+  if (!supported) return console.log("daemon listing isn't supported on this platform (unix only).");
+  if (!daemons.length) return console.log("no leafsync watch daemons are running.");
+  console.log(`${daemons.length} running leafsync watch daemon(s):\n`);
+  daemons.forEach(printDaemon);
+  const pushers = daemons.filter((d) => d.push).length;
+  if (pushers) console.log(`\n⚠ ${pushers} daemon(s) are in PUSH mode — they write to Overleaf. Stop ones you didn't intend.`);
+  console.log(`\nStop with:  leafsync stop --rm <pid> [<pid> …]   (or --rm all)`);
+}
+
+async function removeDaemons(selectors) {
+  const { supported, daemons } = await discoverDaemons();
+  if (!supported) return console.log("daemon removal isn't supported on this platform (unix only).");
+  if (!daemons.length) return console.log("no leafsync watch daemons are running.");
+  if (!selectors.length) {
+    console.log("which daemon(s)? re-run `stop --rm <pid>` (or `--rm all`). Currently running:\n");
+    daemons.forEach(printDaemon);
+    return;
+  }
+  let targets;
+  if (selectors.includes("all")) {
+    targets = daemons.slice();
+  } else {
+    const want = new Set(selectors.map((s) => Number(s)).filter(Number.isFinite));
+    targets = daemons.filter((d) => want.has(d.pid));
+    const missing = [...want].filter((p) => !daemons.some((d) => d.pid === p));
+    if (missing.length) console.log(`not a running leafsync daemon (skipped): ${missing.join(", ")}`);
+  }
+  if (!targets.length) return console.log("nothing matched; run `leafsync stop --ls` to see pids.");
+  for (const d of targets) {
+    const r = await killDaemon(d);
+    if (r.stopped) console.log(`stopped pid ${r.pid}${r.forced ? " (forced)" : ""} — ${d.projectId || d.projectRoot}`);
+    else console.log(`could not stop pid ${r.pid} — try again or kill it manually.`);
+  }
 }
 
 async function cmdUnlink(root) {
@@ -288,7 +339,7 @@ async function main() {
     case "comments": return cmdComments(root, args);
     case "watch": return cmdWatch(root, args);
     case "status": return cmdStatus(root);
-    case "stop": return cmdStop(root);
+    case "stop": return cmdStop(root, args);
     case "unlink": return cmdUnlink(root);
     default:
       console.error(`unknown command: ${cmd}\n`);
