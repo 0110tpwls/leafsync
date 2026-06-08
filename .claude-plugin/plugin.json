@@ -1,0 +1,10 @@
+{
+  "name": "leafsync",
+  "description": "Link a local folder to a live Overleaf project: mirror it locally, surface Overleaf reviewer comments and tracked changes as a local sidecar report (.overleaf/COMMENTS.md), and optionally keep the two in two-way sync. Drives a Playwright-controlled Chromium as the authenticated session host — no browser extension, no passwords. Needs Node + Playwright (one-time ./setup.sh); review Overleaf's Terms of Service before use.",
+  "version": "0.1.0",
+  "author": {
+    "name": "0110tpwls"
+  },
+  "license": "MIT",
+  "keywords": ["overleaf", "latex", "sync", "comments", "playwright", "academic"]
+}

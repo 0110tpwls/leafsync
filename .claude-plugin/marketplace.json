@@ -1,0 +1,14 @@
+{
+  "name": "leafsync",
+  "owner": {
+    "name": "0110tpwls",
+    "email": "0110tpwls@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "leafsync",
+      "source": "./",
+      "description": "Local ↔ Overleaf sync with a local sidecar report of Overleaf reviewer comments and tracked changes. Playwright-driven session host (no browser extension). Opt-in dependencies; review Overleaf's ToS."
+    }
+  ]
+}

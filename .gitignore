@@ -1,0 +1,10 @@
+# node deps
+node_modules/
+
+# leafsync per-project state: session cookies + mirror state (SECRET)
+.overleaf/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp

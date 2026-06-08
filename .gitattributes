@@ -1,0 +1,6 @@
+# Normalize line endings so the plugin works on macOS/Linux as well as Windows.
+* text=auto eol=lf
+
+# Shell scripts MUST be LF or they fail with "bad interpreter" on Unix.
+*.sh text eol=lf
+*.py text eol=lf
