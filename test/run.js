@@ -10,6 +10,7 @@ import { parseProjectUrl } from "../src/config.js";
 import { processProjectStructure } from "../src/mirror.js";
 import { unzip, stripCommonRoot } from "../src/unzip.js";
 import { reconcile, sha256 } from "../src/reconcile.js";
+import { ensureParentFolder } from "../src/tree.js";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -244,6 +245,48 @@ await (async () => {
   r = await reconcile({ mirrorDir: dir, entries: [E("a.tex", "FORCED")], manifest: m, force: true });
   t("reconcile: --force clobbers local", () => {
     assert.equal(readFileSync(path.join(dir, "a.tex"), "utf8"), "FORCED");
+  });
+})();
+
+// --- ensureParentFolder: a bulk add must not double-create a shared new folder ---
+// Regression for the soak finding: dropping a whole project in fires many
+// concurrent watcher events; several files share a brand-new folder. The naive
+// version had each POST createFolder, so all-but-one got a fatal HTTP 400.
+await (async () => {
+  let folderPosts = 0;
+  const created = new Map(); // (parentId/name) -> id, mimics Overleaf's uniqueness
+  const fakePage = {
+    // stands in for api()'s page.evaluate -> returns {ok,status,data}
+    evaluate: async (_fn, arg) => {
+      if (arg.method === "POST" && arg.path.endsWith("/folder")) {
+        folderPosts++;
+        const key = `${arg.body.parent_folder_id}/${arg.body.name}`;
+        if (created.has(key)) return { ok: false, status: 400, data: { message: "exists" } };
+        const id = "F" + created.size;
+        created.set(key, id);
+        return { ok: true, status: 200, data: { _id: id } };
+      }
+      return { ok: true, status: 200, data: {} };
+    },
+  };
+  const folders = { rootId: "root", map: new Map([["", "root"]]) };
+  const files = ["sections/a.tex", "sections/b.tex", "sections/c.tex", "sections/d.tex", "sections/e.tex"];
+  const ids = await Promise.all(files.map((f) => ensureParentFolder(fakePage, "B", "P", "C", f, folders)));
+  t("ensureParentFolder dedupes concurrent bulk-add (no createFolder 400 storm)", () => {
+    assert.equal(new Set(ids).size, 1, "all files resolve to the same folder id");
+    assert.equal(folderPosts, 1, "the shared folder is created exactly once");
+    assert.equal(folders.map.get("sections"), ids[0]);
+  });
+
+  // nested shared folder: figures/experiments/* — both levels created once
+  folderPosts = 0; created.clear();
+  const folders2 = { rootId: "root", map: new Map([["", "root"]]) };
+  const nested = ["figures/experiments/x.pdf", "figures/experiments/y.png", "figures/teaser.jpg"];
+  await Promise.all(nested.map((f) => ensureParentFolder(fakePage, "B", "P", "C", f, folders2)));
+  t("ensureParentFolder creates each nested folder once under concurrency", () => {
+    assert.equal(folderPosts, 2, "figures + figures/experiments, one POST each");
+    assert.ok(folders2.map.get("figures"));
+    assert.ok(folders2.map.get("figures/experiments"));
   });
 })();
 

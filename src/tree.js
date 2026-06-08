@@ -56,23 +56,65 @@ export function folderIdMap(project) {
   return { rootId: root._id, map };
 }
 
-/** Ensure every ancestor folder of `relPath` exists; return the parent folder id. */
+/**
+ * Ensure every ancestor folder of `relPath` exists; return the parent folder id.
+ *
+ * Concurrency-safe: a bulk add (e.g. dropping a whole project into the mirror)
+ * fires many watcher events at once, and several files can share a brand-new
+ * folder. Without coordination they each POST `createFolder` for the same path —
+ * the first wins, the rest get HTTP 400 (already exists). We dedupe concurrent
+ * creates of the same path through an in-flight promise map on `folders`, and
+ * treat "already exists" as success rather than a fatal error.
+ */
 export async function ensureParentFolder(page, base, pid, csrf, relPath, folders) {
   const parts = relPath.split("/").slice(0, -1); // drop the filename
   let parentId = folders.rootId;
   let cur = "";
   for (const part of parts) {
     cur = cur ? `${cur}/${part}` : part;
-    if (folders.map.has(cur)) {
-      parentId = folders.map.get(cur);
-      continue;
-    }
-    const r = await api(page, base, csrf, "POST", `/project/${pid}/folder`, { name: part, parent_folder_id: parentId });
-    if (!r.ok || !r.data || !r.data._id) throw new Error(`createFolder ${cur}: HTTP ${r.status}`);
-    parentId = r.data._id;
-    folders.map.set(cur, parentId);
+    parentId = await ensureOneFolder(page, base, pid, csrf, part, cur, parentId, folders);
   }
   return parentId;
+}
+
+/** Create (or resolve) a single folder `cur` (= `parentPath/name`) idempotently. */
+function ensureOneFolder(page, base, pid, csrf, name, cur, parentId, folders) {
+  if (folders.map.has(cur)) return Promise.resolve(folders.map.get(cur));
+  if (!folders._inflight) folders._inflight = new Map();
+  // Atomic check-and-set (no await between): the first caller installs the job,
+  // every concurrent caller for the same path awaits that one job.
+  const pending = folders._inflight.get(cur);
+  if (pending) return pending;
+  const job = (async () => {
+    if (folders.map.has(cur)) return folders.map.get(cur); // filled by a sibling/CDP echo
+    const r = await api(page, base, csrf, "POST", `/project/${pid}/folder`, { name, parent_folder_id: parentId });
+    let id = r.ok && r.data && r.data._id;
+    if (!id) {
+      // Almost certainly "already exists" (concurrent or prior create). Resolve
+      // its id from the map — a sibling create or the CDP treeNewFolder echo
+      // populates it within a beat — instead of failing the file op.
+      id = folders.map.get(cur) || (await waitForFolderId(folders, cur, 1500));
+      if (!id) throw new Error(`createFolder ${cur}: HTTP ${r.status}`);
+    }
+    folders.map.set(cur, id);
+    return id;
+  })();
+  folders._inflight.set(cur, job);
+  job.finally(() => { if (folders._inflight.get(cur) === job) folders._inflight.delete(cur); }).catch(() => {});
+  return job;
+}
+
+/** Poll `folders.map` for `cur` up to `ms` (the CDP echo fills it shortly after a create). */
+function waitForFolderId(folders, cur, ms) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      if (folders.map.has(cur)) return resolve(folders.map.get(cur));
+      if (Date.now() - start >= ms) return resolve(null);
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
 }
 
 export async function createDoc(page, base, pid, csrf, name, parentFolderId) {
