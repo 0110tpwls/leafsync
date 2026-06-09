@@ -12,7 +12,8 @@ import { unzip, stripCommonRoot } from "../src/unzip.js";
 import { reconcile, sha256 } from "../src/reconcile.js";
 import { ensureParentFolder } from "../src/tree.js";
 import { parseDaemonCommand } from "../src/daemons.js";
-import { merge3, MARK_START, MARK_MID, MARK_END } from "../src/merge.js";
+import { merge3, MARK_START, MARK_MID, MARK_END, unifiedDiff } from "../src/merge.js";
+import { reviewStatus, renderReview } from "../src/review.js";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { compileIgnore } from "../src/ignore.js";
 import os from "node:os";
@@ -495,5 +496,34 @@ await (async () => {
     assert.equal(existsSync(path.join(sd, "base", "new.tex")), false); // base NOT written
   });
 })();
+
+// --- unifiedDiff + review classification ---
+t("unifiedDiff: hunk with -/+ and a valid @@ header", () => {
+  const d = unifiedDiff("a\nb\nc\nd\ne", "a\nb\nX\nd\ne", { aLabel: "old", bLabel: "new" });
+  assert.ok(d.includes("--- old") && d.includes("+++ new"));
+  assert.ok(d.includes("-c") && d.includes("+X"));
+  assert.ok(/@@ -\d+,\d+ \+\d+,\d+ @@/.test(d));
+  assert.ok(d.includes(" b") && d.includes(" d")); // context kept
+});
+t("unifiedDiff: identical -> empty", () => {
+  assert.equal(unifiedDiff("a\nb", "a\nb"), "");
+});
+t("reviewStatus: outgoing / incoming / conflict / insync / differs", () => {
+  assert.equal(reviewStatus("base", "MINE", "base"), "outgoing");
+  assert.equal(reviewStatus("base", "base", "THEIRS"), "incoming");
+  assert.equal(reviewStatus("base", "MINE", "THEIRS"), "conflict");
+  assert.equal(reviewStatus("base", "same", "same"), "insync");
+  assert.equal(reviewStatus(null, "x", "y"), "differs");
+});
+t("renderReview: groups + shows outgoing diff (+ = what you'd push)", () => {
+  const r = renderReview([
+    { path: "a.tex", base: "L1\nL2", local: "L1\nMINE", overleaf: "L1\nL2" }, // outgoing
+    { path: "b.tex", base: "L1\nL2", local: "L1\nL2", overleaf: "L1\nTHEIRS" }, // incoming
+    { path: "c.tex", base: "x", local: "x", overleaf: "x" }, // insync
+  ]);
+  assert.ok(r.includes("1 outgoing, 1 incoming, 0 conflict, 1 in sync"));
+  assert.ok(r.includes("OUTGOING") && r.includes("a.tex") && r.includes("+MINE"));
+  assert.ok(r.includes("INCOMING") && r.includes("+THEIRS"));
+});
 
 console.log(`\n${pass} tests passed.`);

@@ -32,6 +32,8 @@ Usage:
                                   resolves ALL the same way
   leafsync stash                  shelve local changes + revert to base (pull cleanly)
   leafsync stash pop              re-apply shelved changes (3-way merge)
+  leafsync review [path] [--stat] git-diff-style preview of local vs Overleaf,
+                                  grouped outgoing / incoming / conflict (read-only)
   leafsync comments               refresh the local comment report only
   leafsync watch [opts]           live two-way sync (loop-guarded)
   leafsync status                 daemon state / last sync
@@ -62,7 +64,7 @@ function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--background" || a === "--headful" || a === "--force" || a === "--push" || a === "--ls" || a === "--rm" || a === "--ours" || a === "--theirs" || a === "--merged") args[a.slice(2)] = true;
+    if (a === "--background" || a === "--headful" || a === "--force" || a === "--push" || a === "--ls" || a === "--rm" || a === "--ours" || a === "--theirs" || a === "--merged" || a === "--stat") args[a.slice(2)] = true;
     else if (a === "--debug-frames") args.debugFrames = true;
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--verbose" || a === "-v") args.verbose = true;
@@ -351,6 +353,54 @@ async function removeDaemons(selectors) {
   }
 }
 
+async function cmdReview(root, args) {
+  const cfg = await requireConfig(root);
+  const mirrorDir = path.resolve(root, args.mirror || cfg.mirrorDir || ".");
+  const sd = stateDir(root);
+  const { openProject } = await import("./session.js");
+  const { attachCapture } = await import("./cdp.js");
+  const { collectDocRanges, processProjectStructure } = await import("./mirror.js");
+  const { injectedHook } = await import("./inject.js");
+  const { loadIgnore } = await import("./ignore.js");
+  const { readBaseContent } = await import("./reconcile.js");
+  const { renderReview } = await import("./review.js");
+  const { docText } = await import("./ot.js");
+  const { readFile } = await import("node:fs/promises");
+  const { existsSync } = await import("node:fs");
+
+  const onlyPath = args._[1]; // optional: review a single file
+  const log = args.verbose ? (m) => process.stderr.write(`[review] ${m}\n`) : () => {};
+  const { browser, context, page } = await openProject(root, cfg, { headless: !args.headful });
+  try {
+    await page.addInitScript(injectedHook);
+    const cap = await attachCapture(context, page);
+    const treeP = new Promise((res, rej) => { const t = setTimeout(() => rej(new Error("project tree timeout")), 30000); cap.once("project", (v) => { clearTimeout(t); res(v); }); });
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    const project = await treeP;
+    const isIgnored = await loadIgnore(mirrorDir);
+    let { docs } = processProjectStructure(project);
+    docs = docs.filter((d) => !isIgnored(d.path) && (!onlyPath || d.path === onlyPath));
+    const rmap = await collectDocRanges(page, docs, { log });
+    if (docs.length && rmap.size === 0) throw new Error("couldn't read Overleaf content (socket hook not active) — try again");
+    const items = [];
+    for (const d of docs) {
+      const r = rmap.get(d.docId);
+      if (!r || !Array.isArray(r.lines)) continue;
+      const abs = path.join(mirrorDir, d.path);
+      const baseBuf = await readBaseContent(sd, d.path);
+      items.push({
+        path: d.path,
+        base: baseBuf == null ? null : baseBuf.toString("utf8"),
+        local: existsSync(abs) ? await readFile(abs, "utf8") : "",
+        overleaf: docText(r.lines),
+      });
+    }
+    process.stdout.write(renderReview(items, { stat: !!args.stat }));
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
 async function cmdResolve(root, args) {
   const cfg = await requireConfig(root);
   const mirrorDir = path.resolve(root, args.mirror || cfg.mirrorDir || ".");
@@ -417,6 +467,7 @@ async function main() {
     case "pull": return cmdPull(root, args);
     case "comments": return cmdComments(root, args);
     case "watch": return cmdWatch(root, args);
+    case "review": return cmdReview(root, args);
     case "resolve": return cmdResolve(root, args);
     case "stash": return cmdStash(root, args);
     case "status": return cmdStatus(root);

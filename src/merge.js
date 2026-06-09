@@ -66,6 +66,50 @@ function diffHunks(base, side) {
 }
 
 /**
+ * Unified diff (git-style) of `aText` -> `bText`. Returns "" if identical.
+ * Used by `review` to preview local vs Overleaf before pushing.
+ */
+export function unifiedDiff(aText, bText, { aLabel = "a", bLabel = "b", context = 3 } = {}) {
+  const a = splitLines(aText), b = splitLines(bText);
+  const hunks = diffHunks(a, b);
+  if (!hunks.length) return "";
+  const aToB = (ai) => {
+    let off = 0;
+    for (const h of hunks) { if (h.baseHi <= ai) off += h.repl.length - (h.baseHi - h.baseLo); else break; }
+    return ai + off;
+  };
+  // coalesce hunks separated by <= 2*context unchanged lines into one shown block
+  const groups = [];
+  for (const h of hunks) {
+    const last = groups[groups.length - 1];
+    if (last && h.baseLo - last.aHi <= 2 * context) { last.aHi = h.baseHi; last.hunks.push(h); }
+    else groups.push({ aLo: h.baseLo, aHi: h.baseHi, hunks: [h] });
+  }
+  const lines = [`--- ${aLabel}`, `+++ ${bLabel}`];
+  for (const g of groups) {
+    const ctxStart = Math.max(0, g.aLo - context);
+    const ctxEnd = Math.min(a.length, g.aHi + context);
+    const aCount = ctxEnd - ctxStart;
+    const delta = g.hunks.reduce((s, h) => s + h.repl.length - (h.baseHi - h.baseLo), 0);
+    lines.push(`@@ -${ctxStart + 1},${aCount} +${aToB(ctxStart) + 1},${aCount + delta} @@`);
+    let ai = ctxStart, k = 0;
+    while (ai < ctxEnd) {
+      const h = g.hunks[k];
+      if (h && h.baseLo === ai) {
+        for (let i = h.baseLo; i < h.baseHi; i++) lines.push("-" + a[i]);
+        for (const r of h.repl) lines.push("+" + r);
+        ai = h.baseHi; k++;
+      } else { lines.push(" " + a[ai]); ai++; }
+    }
+    while (k < g.hunks.length && g.hunks[k].baseLo === ai && g.hunks[k].baseLo === g.hunks[k].baseHi) {
+      for (const r of g.hunks[k].repl) lines.push("+" + r);
+      k++;
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
  * 3-way merge. Returns { clean, text, conflicts:[{local,incoming}] }.
  * Auto-merges regions only ONE side changed (even if the two sides' edits are on
  * different lines), and emits git-style markers only where the two sides changed
