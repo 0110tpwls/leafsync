@@ -258,6 +258,13 @@ async function cmdStatus(root) {
   } else {
     console.log(`watch: not running (stale pid file for ${d.pid}; \`stop\` to clear).`);
   }
+  // git-status-like: surface unresolved conflicts + a pending stash
+  try {
+    const { listConflicts, hasStash } = await import("./resolve.js");
+    const conflicts = await listConflicts(stateDir(root));
+    if (conflicts.length) console.log(`conflicts: ${conflicts.length} unresolved (${conflicts.map((c) => c.path).slice(0, 5).join(", ")}) — run \`resolve\``);
+    if (await hasStash(stateDir(root))) console.log("stash: changes shelved — \`stash pop\` to re-apply");
+  } catch { /* ignore */ }
 }
 
 /** Last non-empty line of a log file (best-effort), for status. */
