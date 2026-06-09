@@ -175,6 +175,41 @@ export async function runForegroundWatch({ root, cfg, args }) {
     await mkdir(path.dirname(d.abs), { recursive: true });
     await writeFile(d.abs, d.text, "utf8");
   };
+
+  // --- live comment-report refresh ---
+  // Comments added while the daemon runs must show up in COMMENTS.md, not only at
+  // startup. A NEW comment arrives as a comment OT op (carries c/t, no i/d) -> we
+  // re-join that doc for fresh ranges. Replies/resolves only touch the threads
+  // endpoint -> a periodic threads refresh catches those. Both go through a
+  // debounced rebuild so a burst of changes coalesces into one write.
+  const commentDirty = new Set(); // docIds whose ranges changed -> re-join to refresh
+  let reportTimer = null;
+  const rebuildReport = async () => {
+    // Authoritative ranges for docs whose comments changed. Done on a DELAY (see
+    // scheduleReport): an immediate re-join races Overleaf's cross-session
+    // replication lag and returns ranges from just before the new comment landed.
+    for (const docId of [...commentDirty]) {
+      commentDirty.delete(docId);
+      const d = byId.get(docId);
+      if (!d) continue;
+      const r = await joinOneDoc(page, d.docId);
+      if (r && r.ranges) {
+        d.ranges = r.ranges;
+        if (Array.isArray(r.lines)) d.text = docText(r.lines);
+        d.version = Math.max(d.version | 0, r.version | 0);
+      }
+    }
+    try {
+      const threads = await fetchThreads(page, cfg.deployment, cfg.projectId);
+      await writeReport(stateDir(root), buildReport([...byId.values()], threads));
+    } catch { /* best-effort */ }
+  };
+  const scheduleReport = (delay = 3000) => {
+    if (reportTimer) clearTimeout(reportTimer);
+    reportTimer = setTimeout(() => { reportTimer = null; rebuildReport(); }, delay);
+  };
+  const reportInterval = setInterval(rebuildReport, 30000); // replies/resolves safety-net
+
   cap.on("remoteEdit", async ({ docId, op, version }) => {
     if (!Array.isArray(op) || op.length === 0) return; // ack form ([{v}]) — ignore
     if (echoGuard.shouldDropByOp(op)) return; // our own write-back echo
@@ -185,6 +220,17 @@ export async function runForegroundWatch({ root, cfg, args }) {
     if (docId && byId.has(docId)) candidates = [byId.get(docId)];
     else candidates = [...byId.values()].filter((d) => !d.diverged && (d.version | 0) === v);
     if (!candidates.length) return; // nothing at that version (echo, or untracked doc)
+
+    // Comment / range op (carries c or t, no insert/delete): a comment was added
+    // or moved. Text is unchanged; mark the doc(s) dirty and refresh the report on
+    // a delay (re-joining for fresh ranges + threads) so the new comment shows up
+    // in COMMENTS.md live.
+    if (op.some((o) => o && o.i == null && o.d == null && (o.c != null || o.t != null))) {
+      for (const d of candidates) commentDirty.add(d.docId);
+      scheduleReport(3000);
+      log(`OL→local: comment change on ${candidates.map((d) => d.path).join(", ")} — refreshing report`);
+      return;
+    }
 
     // Unambiguous + the op applies cleanly -> fast path: apply incrementally.
     const appliable = candidates.filter((d) => opApplies(d.text, op));
@@ -518,6 +564,8 @@ export async function runForegroundWatch({ root, cfg, args }) {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`stopping (${sig})…`);
+    clearInterval(reportInterval);
+    if (reportTimer) clearTimeout(reportTimer);
     try { releaseLock && releaseLock(); } catch { /* ignore */ }
     await watcher.close().catch(() => {});
     await browser.close().catch(() => {});
@@ -571,5 +619,6 @@ function onceEvent(emitter, event, ms) {
 }
 
 function log(msg) {
-  process.stdout.write(`[overleaf-sync ${new Date().toISOString().slice(11, 19)}] ${msg}\n`);
+  // include the pid so lines are attributable when several daemons run / logs merge
+  process.stdout.write(`[leafsync(${process.pid}) ${new Date().toISOString().slice(11, 19)}] ${msg}\n`);
 }
