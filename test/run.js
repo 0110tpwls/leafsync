@@ -13,7 +13,8 @@ import { reconcile, sha256 } from "../src/reconcile.js";
 import { ensureParentFolder } from "../src/tree.js";
 import { parseDaemonCommand } from "../src/daemons.js";
 import { merge3, MARK_START, MARK_MID, MARK_END } from "../src/merge.js";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { compileIgnore } from "../src/ignore.js";
 import os from "node:os";
 import path from "node:path";
 
@@ -461,6 +462,38 @@ await (async () => {
       assert.equal(readFileSync(path.join(dir, "f.tex"), "utf8"), "OL1\nMINE\nB3"); // both changes
     });
   }
+})();
+
+// --- .overleafignore matching ---
+t("compileIgnore: glob, dir, anchor, segment patterns", () => {
+  const ig = compileIgnore("# build junk\n*.aux\nbuild/\n/main.pdf\nfigures/*.png\n");
+  assert.equal(ig("paper.aux"), true);          // *.aux at root
+  assert.equal(ig("sec/paper.aux"), true);      // *.aux at any depth
+  assert.equal(ig("build/x.tex"), true);        // directory pattern
+  assert.equal(ig("rebuild/x.tex"), false);     // word boundary, not 'build'
+  assert.equal(ig("main.pdf"), true);           // anchored to root
+  assert.equal(ig("sub/main.pdf"), false);      // anchored -> not nested
+  assert.equal(ig("figures/a.png"), true);
+  assert.equal(ig("figures/sub/a.png"), false); // * does not cross '/'
+  assert.equal(ig("main.tex"), false);
+});
+t("compileIgnore: '!' negation (last match wins)", () => {
+  const ig = compileIgnore("*.tex\n!keep.tex");
+  assert.equal(ig("a.tex"), true);
+  assert.equal(ig("keep.tex"), false);
+});
+
+// --- pull --dry-run: classify without touching disk ---
+await (async () => {
+  const { reconcile } = await import("../src/reconcile.js");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "oldry-"));
+  const sd = path.join(dir, ".overleaf");
+  const r = await reconcile({ mirrorDir: dir, entries: [{ name: "new.tex", data: Buffer.from("hi") }], manifest: {}, stateDir: sd, dryRun: true });
+  t("reconcile --dry-run classifies but writes nothing", () => {
+    assert.deepEqual(r.result.created, ["new.tex"]);
+    assert.equal(existsSync(path.join(dir, "new.tex")), false);   // file NOT written
+    assert.equal(existsSync(path.join(sd, "base", "new.tex")), false); // base NOT written
+  });
 })();
 
 console.log(`\n${pass} tests passed.`);

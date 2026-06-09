@@ -21,10 +21,11 @@ const HELP = `leafsync — two-way sync + comment mirror for Overleaf (write-bac
 
 Usage:
   leafsync link <project-url>     one-time login; record project + session
-  leafsync pull [--force]         mirror Overleaf -> local + refresh comments
+  leafsync pull [--force] [--dry-run]
+                                  mirror Overleaf -> local + refresh comments
                                    (safe: 3-way auto-merge; true conflicts kept
                                     for resolve; --force takes Overleaf's, drops
-                                    local)
+                                    local; --dry-run previews, writes nothing)
   leafsync resolve [--ours|--theirs|--merged]
                                   resolve merge conflicts. no flag = interactive
                                   (per file: ours / theirs / edit); a flag
@@ -63,6 +64,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--background" || a === "--headful" || a === "--force" || a === "--push" || a === "--ls" || a === "--rm" || a === "--ours" || a === "--theirs" || a === "--merged") args[a.slice(2)] = true;
     else if (a === "--debug-frames") args.debugFrames = true;
+    else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--verbose" || a === "-v") args.verbose = true;
     else if (a === "--interval") args.interval = Number(argv[++i]);
     else if (a === "--timeout") args.timeout = Number(argv[++i]);
@@ -132,7 +134,7 @@ async function capturePull({ root, cfg, mirrorDir, headless, writeFiles, args = 
     await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
     const { docs, sync } = await pullProject({
       page, cap, deployment: cfg.deployment, projectId: cfg.projectId,
-      mirrorDir, stateDir: stateDir(root), force: args.force, log,
+      mirrorDir, stateDir: stateDir(root), force: args.force, log, dryRun: !!args.dryRun,
     });
 
     // Comment ranges: send joinDoc per doc over the app's socket (classic
@@ -184,8 +186,10 @@ async function capturePull({ root, cfg, mirrorDir, headless, writeFiles, args = 
         .catch(() => {});
     }
     const report = buildReport(docs, threads);
-    await writeReport(stateDir(root), report);
-    log(`report: ${report.entries.length} comment(s) written`);
+    if (!args.dryRun) {
+      await writeReport(stateDir(root), report);
+      log(`report: ${report.entries.length} comment(s) written`);
+    }
     report.sync = sync;
     return report;
   } finally {
@@ -199,14 +203,30 @@ async function cmdPull(root, args) {
   await ensureStateDir(root);
   const report = await capturePull({ root, cfg, mirrorDir, headless: !args.headful, writeFiles: true, args });
   const open = report.entries.filter((e) => !e.resolved).length;
-  const s = report.sync || { created: [], updated: [], kept: [], conflicts: [] };
+  const s = report.sync || { created: [], updated: [], merged: [], kept: [], conflicts: [] };
+  const list = (a) => (a && a.length ? `: ${a.slice(0, 8).join(", ")}${a.length > 8 ? " …" : ""}` : "");
+
+  if (args.dryRun) {
+    console.log(`DRY RUN — nothing written. \`pull\` would:`);
+    if (s.created.length) console.log(`  + create ${s.created.length}${list(s.created)}`);
+    if (s.updated.length) console.log(`  ↓ fast-forward ${s.updated.length}${list(s.updated)}`);
+    if (s.merged.length) console.log(`  ⤬ auto-merge ${s.merged.length} (both changed, no overlap)${list(s.merged)}`);
+    if (s.kept.length) console.log(`  = keep your local edits on ${s.kept.length}${list(s.kept)}`);
+    if (s.conflicts.length) console.log(`  ⚠ CONFLICT on ${s.conflicts.length}${list(s.conflicts.map((c) => c.path))} (would need \`resolve\`)`);
+    if (!s.created.length && !s.updated.length && !s.merged.length && !s.kept.length && !s.conflicts.length) console.log("  (nothing — already in sync)");
+    console.log(`comments: ${report.entries.length} (${open} open) — not written (dry run)`);
+    return;
+  }
+
   console.log(`pulled project to ${mirrorDir}`);
-  console.log(`files: ${s.created.length} new, ${s.updated.length} updated, ${s.kept.length} kept (local edits), ${s.conflicts.length} conflict(s)`);
+  console.log(`files: ${s.created.length} new, ${s.updated.length} updated, ${s.merged.length} auto-merged, ${s.kept.length} kept (local edits), ${s.conflicts.length} conflict(s)`);
   if (s.kept.length) console.log(`  kept your local edits (not overwritten): ${s.kept.join(", ")}`);
   for (const c of s.conflicts) {
-    console.log(`  ⚠ CONFLICT ${c.path}: changed locally AND on Overleaf — kept yours; Overleaf's version saved as ${path.basename(c.incoming)}`);
+    console.log(c.conflictFile
+      ? `  ⚠ CONFLICT ${c.path}: changed both sides — kept yours; markers in .overleaf/conflicts/. Run \`leafsync resolve\`.`
+      : `  ⚠ CONFLICT ${c.path}: changed both sides — kept yours; Overleaf's version saved as ${path.basename(c.incoming)}`);
   }
-  if (s.conflicts.length) console.log(`  resolve by merging, then delete the .overleaf-incoming file. (Use --force to take Overleaf's version wholesale.)`);
+  if (s.conflicts.length) console.log(`  (or re-run with --force to take Overleaf's version wholesale.)`);
   console.log(`comments: ${report.entries.length} (${open} open) -> ${statePath(root, "COMMENTS.md")}`);
 }
 

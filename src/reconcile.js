@@ -57,22 +57,28 @@ function isBinaryBuf(buf) {
   return Buffer.isBuffer(buf) && buf.includes(0); // NUL byte -> treat as binary (don't merge)
 }
 
-/** Reconcile incoming entries against local + the base shadow. */
-export async function reconcile({ mirrorDir, entries, manifest, force = false, log = () => {}, stateDir = null }) {
+/**
+ * Reconcile incoming entries against local + the base shadow.
+ * `dryRun` classifies every file (created/updated/merged/kept/conflict) WITHOUT
+ * touching the disk — used by `pull --dry-run` to preview.
+ */
+export async function reconcile({ mirrorDir, entries, manifest, force = false, log = () => {}, stateDir = null, dryRun = false }) {
   const result = { created: [], updated: [], inSync: [], kept: [], merged: [], conflicts: [] };
   const next = { ...manifest };
   const conflictRecords = []; // { path } — full state lives in .overleaf/conflicts/
+  const put = dryRun ? async () => {} : writeFile;
+  const md = dryRun ? async () => {} : mkdir;
 
   for (const e of entries) {
     const dest = path.join(mirrorDir, e.name);
     const incoming = e.data;
     const incomingHash = sha256(incoming);
     const exists = existsSync(dest);
-    const recordBase = async () => { if (stateDir) await writeBaseContent(stateDir, e.name, incoming); };
+    const recordBase = async () => { if (stateDir && !dryRun) await writeBaseContent(stateDir, e.name, incoming); };
 
     if (!exists) {
-      await mkdir(path.dirname(dest), { recursive: true });
-      await writeFile(dest, incoming);
+      await md(path.dirname(dest), { recursive: true });
+      await put(dest, incoming);
       next[e.name] = incomingHash; await recordBase();
       result.created.push(e.name);
       continue;
@@ -83,7 +89,7 @@ export async function reconcile({ mirrorDir, entries, manifest, force = false, l
     const baseHash = manifest[e.name];
 
     if (force) {
-      await writeFile(dest, incoming); next[e.name] = incomingHash; await recordBase();
+      await put(dest, incoming); next[e.name] = incomingHash; await recordBase();
       (localHash !== incomingHash ? result.updated : result.inSync).push(e.name);
       continue;
     }
@@ -91,7 +97,7 @@ export async function reconcile({ mirrorDir, entries, manifest, force = false, l
     if (localHash === incomingHash) {
       next[e.name] = incomingHash; await recordBase(); result.inSync.push(e.name);
     } else if (localHash === baseHash) {
-      await writeFile(dest, incoming); next[e.name] = incomingHash; await recordBase(); result.updated.push(e.name);
+      await put(dest, incoming); next[e.name] = incomingHash; await recordBase(); result.updated.push(e.name);
     } else if (baseHash !== undefined && incomingHash === baseHash) {
       result.kept.push(e.name); // local edit, Overleaf unchanged -> keep local (pending push)
     } else {
@@ -103,7 +109,7 @@ export async function reconcile({ mirrorDir, entries, manifest, force = false, l
         if (m.clean) {
           // auto-merged: local now carries both sides' changes -> base advances to
           // Overleaf's version, and the merged result is a pending push.
-          await writeFile(dest, m.text, "utf8");
+          await put(dest, m.text, "utf8");
           next[e.name] = sha256(Buffer.from(m.text, "utf8"));
           await recordBase();
           result.merged.push(e.name);
@@ -112,18 +118,18 @@ export async function reconcile({ mirrorDir, entries, manifest, force = false, l
         // true conflict: keep LOCAL in the live file (so it still compiles and the
         // markers never get pushed); write the markered version + theirs to
         // .overleaf/conflicts/ for review/resolve. Baseline stays until resolved.
-        await writeConflictFiles(stateDir, e.name, m.text, incoming);
+        if (!dryRun) await writeConflictFiles(stateDir, e.name, m.text, incoming);
         conflictRecords.push({ path: e.name });
         result.conflicts.push({ path: e.name, conflictFile: path.join(conflictsDir(stateDir), e.name) });
       } else {
         const side = dest + ".overleaf-incoming";
-        await writeFile(side, incoming);
+        await put(side, incoming);
         result.conflicts.push({ path: e.name, incoming: side });
       }
     }
   }
 
-  if (stateDir) await writeConflictReport(stateDir, conflictRecords);
+  if (stateDir && !dryRun) await writeConflictReport(stateDir, conflictRecords);
   return { result, manifest: next };
 }
 

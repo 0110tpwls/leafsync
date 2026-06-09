@@ -46,7 +46,7 @@ node "$CLI" <command> [options] --project-root "$(pwd)"
 | Command | What it does |
 | --- | --- |
 | `link <project-url>` | Opens a **headful** browser to log in once; saves the session + records the project. Ask the user for their `https://www.overleaf.com/project/<id>` URL. |
-| `pull [--force]` | Mirrors the Overleaf project to the local folder **and** writes the comment report. Read-only toward Overleaf. **Safe, git-style 3-way merge:** against a shadow base (`.overleaf/base/`, the last-synced Overleaf content) it auto-merges edits that don't overlap, keeps untouched files fast-forwarding, and on a true overlap **keeps your local file live** (so it still compiles) while writing git-style conflict markers to `.overleaf/conflicts/<file>` + a summary in `.overleaf/CONFLICTS.md`. `--force` takes Overleaf's version wholesale (discards local). |
+| `pull [--force] [--dry-run]` | Mirrors the Overleaf project to the local folder **and** writes the comment report. Read-only toward Overleaf. **Safe, git-style 3-way merge:** against a shadow base (`.overleaf/base/`, the last-synced Overleaf content) it auto-merges edits that don't overlap, keeps untouched files fast-forwarding, and on a true overlap **keeps your local file live** (so it still compiles) while writing git-style conflict markers to `.overleaf/conflicts/<file>` + a summary in `.overleaf/CONFLICTS.md`. `--force` takes Overleaf's version wholesale (discards local). **`--dry-run` previews** the create/fast-forward/auto-merge/keep/conflict plan and writes nothing. |
 | `resolve [--ours\|--theirs\|--merged]` | Resolve merge conflicts. **No flag → interactive**, per file: `(o)urs` keeps your version, `(t)heirs` takes Overleaf's, `(e)dit` opens the marked-up file in `$EDITOR` to hand-merge. A flag resolves **all** conflicts the same way (works when piped). Reads `.overleaf/conflicts.json`. |
 | `stash` / `stash pop` | `stash` shelves your local changes and reverts the files to base so you can `pull` cleanly; `stash pop` re-applies them on top via a 3-way merge (conflicts handled as above). Like `git stash`. |
 | `comments` | Refreshes just the comment report (`.overleaf/COMMENTS.md` + `comments.json`). |
@@ -59,6 +59,12 @@ node "$CLI" <command> [options] --project-root "$(pwd)"
 After `pull`/`comments`, **Read `.overleaf/COMMENTS.md`** and present the open
 comments to the user, grouped by file, each as `file.tex:line` with the quoted span
 and the thread — then offer to act on them (e.g. add the requested citation).
+
+**`.overleafignore`** (optional, at the mirror root): gitignore-style patterns for
+files to keep OUT of the sync in both directions (not pulled, not pushed, not
+mirrored). Good for LaTeX build junk — e.g. `*.aux`, `*.log`, `*.synctex.gz`,
+`build/`, or local-only notes. Supports `*`/`**`/`?`/`[...]`, `/`-anchoring,
+trailing-`/` directories, and `!` negation.
 
 ## Sync modes (`watch`)
 

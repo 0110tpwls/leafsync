@@ -13,6 +13,7 @@ import path from "node:path";
 import { unzip, stripCommonRoot } from "./unzip.js";
 import { findRanges } from "./socketio.js";
 import { reconcile, readManifest, writeManifest, summarize } from "./reconcile.js";
+import { loadIgnore } from "./ignore.js";
 
 /**
  * BFS Overleaf's project.rootFolder into flat lists.
@@ -53,7 +54,7 @@ export function processProjectStructure(project) {
  * @returns { docs:[{ docId, path, text, ranges }], sync } where sync is the
  *          reconcile result (created/updated/kept/conflicts).
  */
-export async function pullProject({ page, cap, deployment, projectId, mirrorDir, stateDir = null, force = false, log = () => {} }) {
+export async function pullProject({ page, cap, deployment, projectId, mirrorDir, stateDir = null, force = false, log = () => {}, dryRun = false }) {
   // The project tree arrives once on connect; wait for it (or use a cached one).
   log("waiting for project tree (joinProjectResponse)…");
   const project = await waitFor(cap, "project", 30000).catch(() => {
@@ -112,8 +113,14 @@ export async function pullProject({ page, cap, deployment, projectId, mirrorDir,
 
   let entries = unzip(Buffer.from(zipB64.b64, "base64"));
   entries = stripCommonRoot(entries);
-  const fileEntries = entries.filter((e) => !e.dir);
+  let fileEntries = entries.filter((e) => !e.dir);
   const byName = new Map(fileEntries.map((e) => [e.name, e.data]));
+
+  // .overleafignore: drop ignored paths from the sync (both report + reconcile).
+  const isIgnored = await loadIgnore(mirrorDir);
+  const nIgnored = fileEntries.filter((e) => isIgnored(e.name)).length;
+  if (nIgnored) log(`.overleafignore: skipping ${nIgnored} file(s)`);
+  fileEntries = fileEntries.filter((e) => !isIgnored(e.name));
 
   // Reconcile against the baseline manifest instead of clobbering: local edits
   // are kept, true conflicts are stashed as <file>.overleaf-incoming. The state
@@ -121,10 +128,10 @@ export async function pullProject({ page, cap, deployment, projectId, mirrorDir,
   const sd = stateDir || path.join(mirrorDir, ".overleaf");
   const manifest = await readManifest(sd);
   const { result: sync, manifest: nextManifest } = await reconcile({
-    mirrorDir, entries: fileEntries, manifest, force, log, stateDir: sd,
+    mirrorDir, entries: fileEntries, manifest, force, log, stateDir: sd, dryRun,
   });
-  await writeManifest(sd, nextManifest);
-  log(`mirror: ${summarize(sync)}`);
+  if (!dryRun) await writeManifest(sd, nextManifest);
+  log(`${dryRun ? "would mirror" : "mirror"}: ${summarize(sync)}`);
   if (sync.merged.length) log(`  auto-merged ${sync.merged.length} file(s) (both sides changed, no overlap): ${sync.merged.slice(0, 5).join(", ")}`);
   for (const c of sync.conflicts) log(`  ⚠ conflict: ${c.path} (changed locally AND on Overleaf) → kept local; ${c.conflictFile ? "markers in .overleaf/conflicts/, run `leafsync resolve`" : "Overleaf version at " + path.basename(c.incoming)}`);
   if (sync.kept.length) log(`  kept ${sync.kept.length} local edit(s): ${sync.kept.slice(0, 5).join(", ")}${sync.kept.length > 5 ? "…" : ""}`);
@@ -133,6 +140,7 @@ export async function pullProject({ page, cap, deployment, projectId, mirrorDir,
   // project tree's docs by path; ranges are not in the ZIP (pending joinDoc).
   const docResults = [];
   for (const doc of docs) {
+    if (isIgnored(doc.path)) continue;
     const data = byName.get(doc.path) || matchBySuffix(byName, doc.path);
     const text = data ? data.toString("utf8") : "";
     if (!data) log(`⚠ ${doc.path}: not found in ZIP (kept empty)`);

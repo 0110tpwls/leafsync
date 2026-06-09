@@ -91,7 +91,13 @@ export async function runForegroundWatch({ root, cfg, args }) {
   const treeP = onceEvent(cap, "project", 30000);
   await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
   const project = await treeP;
-  const { docs, files } = processProjectStructure(project);
+  const { loadIgnore } = await import("./ignore.js");
+  const isIgnored = await loadIgnore(mirrorDir);
+  const { docs: docsRaw, files: filesRaw } = processProjectStructure(project);
+  const docs = docsRaw.filter((d) => !isIgnored(d.path));
+  const files = filesRaw.filter((f) => !isIgnored(f.path));
+  const nIgnored = (docsRaw.length - docs.length) + (filesRaw.length - files.length);
+  if (nIgnored) log(`.overleafignore: skipping ${nIgnored} file(s)`);
 
   // Track binary files (figures) by path<->id so we can sync changes/deletes and
   // recognise our own upload echoes. Initial bytes come from `pull`; watch only
@@ -268,6 +274,7 @@ export async function runForegroundWatch({ root, cfg, args }) {
   // the new doc gets the content; comments on the old doc don't carry over.)
   const watcher = await watchMirror(mirrorDir, fsGuard, async ({ type, path: fp, binary }) => {
     const rel = path.relative(mirrorDir, fp);
+    if (isIgnored(rel)) return; // .overleafignore — never push these
 
     // --- local FOLDER delete -> delete the folder on Overleaf ---
     // (deleting a folder fires unlink for each file PLUS unlinkDir for the dir;
@@ -406,7 +413,7 @@ export async function runForegroundWatch({ root, cfg, args }) {
       log(`push error on ${d.path}: ${e.message} — re-syncing`);
       await resync(page, d, log);
     }
-  });
+  }, { isIgnored });
 
   // ---- OL -> local tree ops: mirror create/delete/rename done on Overleaf ----
   const { rename, rm } = await import("node:fs/promises");
@@ -450,6 +457,7 @@ export async function runForegroundWatch({ root, cfg, args }) {
   cap.on("treeNew", async ({ kind, parentFolderId, id, name }) => {
     try {
       const rel = resolveNewPath(parentFolderId, name);
+      if (isIgnored(rel)) return; // .overleafignore — don't mirror it locally
       const abs = path.join(mirrorDir, rel);
       if (byId.has(id) || byPath.has(abs)) return; // our own create echo
       if (kind !== "doc") {

@@ -2,6 +2,9 @@
 // chokidar is imported lazily so offline/help paths don't need it installed.
 // The FsSyncGuard filters out our own inbound-sync writes (loop prevention).
 
+import path from "node:path";
+const pathRel = (base, p) => path.relative(base, p);
+
 const TEXT_EXT = new Set([
   ".tex", ".bib", ".cls", ".sty", ".bst", ".txt", ".md", ".markdown",
   ".tikz", ".pgf", ".bbl", ".asy",
@@ -39,11 +42,20 @@ async function chokidar() {
  * of text OR binary files that did NOT originate from our own inbound sync (per
  * fsGuard). `binary` flags figure/asset files. Returns a handle with .close().
  */
-export async function watchMirror(mirrorDir, fsGuard, onChange, { ignoreInitial = true } = {}) {
+export async function watchMirror(mirrorDir, fsGuard, onChange, { ignoreInitial = true, isIgnored = null } = {}) {
   const ch = await chokidar();
+  const builtin = /(^|[/\\])(\.overleaf|node_modules|\.git)([/\\]|$)/;
+  const ignored = (p) => {
+    if (builtin.test(p)) return true;
+    if (isIgnored) {
+      const rel = pathRel(mirrorDir, p);
+      if (rel && !rel.startsWith("..") && isIgnored(rel)) return true; // .overleafignore
+    }
+    return false;
+  };
   const w = ch.watch(mirrorDir, {
     ignoreInitial,
-    ignored: /(^|[/\\])(\.overleaf|node_modules|\.git)([/\\]|$)/,
+    ignored,
     awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 50 },
   });
   const handler = (type) => (filePath) => {
