@@ -143,13 +143,22 @@ pulled in ONE authenticated request to the "Download as ZIP" endpoint
 file-tree DOM (files in collapsed folders have no node — the original 0-byte cause)
 and the docstore REST route (which 404s on www.overleaf.com).
 
+**ZIP fallback:** the ZIP endpoint sometimes 500s (it rate-limits / chokes under
+load). When it fails after retries, `pull` automatically **falls back to fetching
+content per-document over the socket** — `joinDoc` for text docs, `/project/{id}/
+file/{id}` for binaries (byte-identical) — so a flaky ZIP never hard-fails the pull.
+Force this path with `pull --no-zip` if your project's ZIP endpoint is persistently
+broken.
+
 `--verbose` prints `downloading project ZIP…`, the ZIP size, and `extracted N
 files`. Common causes if it still fails:
 - **`no joinProjectResponse captured`** — the tree frame wasn't seen / parsed.
   `frames.log` shows the real Socket.IO/Engine.IO shape so `socketio.js parseFrame()`
   can be extended (it already handles legacy `5:::` and Engine.IO v2 `42[…]`).
-- **`ZIP download failed (status …)`** — the download route differs or the session
-  expired; re-run `link`, or report the status.
+- **`ZIP download failed (status …)`** — handled automatically now: `pull` falls
+  back to a per-document socket fetch and continues. If the fallback ALSO yields
+  nothing the session is likely expired — re-run `link`. Use `--no-zip` to skip the
+  ZIP attempt entirely.
 - **`comment sync: socket hook not active`** — the injected WebSocket wrapper
   (`inject.js`) didn't capture the app's socket, so ranges couldn't be fetched. The
   content mirror is still fine. Check `--debug-frames`: www.overleaf.com uses legacy

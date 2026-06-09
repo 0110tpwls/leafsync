@@ -21,11 +21,12 @@ const HELP = `leafsync — two-way sync + comment mirror for Overleaf (write-bac
 
 Usage:
   leafsync link <project-url>     one-time login; record project + session
-  leafsync pull [--force] [--dry-run]
+  leafsync pull [--force] [--dry-run] [--no-zip]
                                   mirror Overleaf -> local + refresh comments
                                    (safe: 3-way auto-merge; true conflicts kept
                                     for resolve; --force takes Overleaf's, drops
-                                    local; --dry-run previews, writes nothing)
+                                    local; --dry-run previews, writes nothing;
+                                    --no-zip fetches per-doc over the socket)
   leafsync resolve [--ours|--theirs|--merged]
                                   resolve merge conflicts. no flag = interactive
                                   (per file: ours / theirs / edit); a flag
@@ -67,6 +68,7 @@ function parseArgs(argv) {
     if (a === "--background" || a === "--headful" || a === "--force" || a === "--push" || a === "--ls" || a === "--rm" || a === "--ours" || a === "--theirs" || a === "--merged" || a === "--stat") args[a.slice(2)] = true;
     else if (a === "--debug-frames") args.debugFrames = true;
     else if (a === "--dry-run") args.dryRun = true;
+    else if (a === "--no-zip") args.noZip = true;
     else if (a === "--verbose" || a === "-v") args.verbose = true;
     else if (a === "--interval") args.interval = Number(argv[++i]);
     else if (a === "--timeout") args.timeout = Number(argv[++i]);
@@ -136,7 +138,7 @@ async function capturePull({ root, cfg, mirrorDir, headless, writeFiles, args = 
     await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
     const { docs, sync } = await pullProject({
       page, cap, deployment: cfg.deployment, projectId: cfg.projectId,
-      mirrorDir, stateDir: stateDir(root), force: args.force, log, dryRun: !!args.dryRun,
+      mirrorDir, stateDir: stateDir(root), force: args.force, log, dryRun: !!args.dryRun, noZip: !!args.noZip,
     });
 
     // Comment ranges: send joinDoc per doc over the app's socket (classic

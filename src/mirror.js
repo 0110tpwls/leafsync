@@ -14,6 +14,8 @@ import { unzip, stripCommonRoot } from "./unzip.js";
 import { findRanges } from "./socketio.js";
 import { reconcile, readManifest, writeManifest, summarize } from "./reconcile.js";
 import { loadIgnore } from "./ignore.js";
+import { downloadFileB64 } from "./tree.js";
+import { docText } from "./ot.js";
 
 /**
  * BFS Overleaf's project.rootFolder into flat lists.
@@ -54,7 +56,7 @@ export function processProjectStructure(project) {
  * @returns { docs:[{ docId, path, text, ranges }], sync } where sync is the
  *          reconcile result (created/updated/kept/conflicts).
  */
-export async function pullProject({ page, cap, deployment, projectId, mirrorDir, stateDir = null, force = false, log = () => {}, dryRun = false }) {
+export async function pullProject({ page, cap, deployment, projectId, mirrorDir, stateDir = null, force = false, log = () => {}, dryRun = false, noZip = false }) {
   // The project tree arrives once on connect; wait for it (or use a cached one).
   log("waiting for project tree (joinProjectResponse)…");
   const project = await waitFor(cap, "project", 30000).catch(() => {
@@ -77,7 +79,6 @@ export async function pullProject({ page, cap, deployment, projectId, mirrorDir,
   // joinDoc can't be sent from a passive CDP sniff, so the ZIP is the robust
   // path for the mirror. (Comment RANGES still need joinDoc — see note below.)
   const t0 = Date.now();
-  log("downloading project ZIP…");
   const zipUrl = `${deployment}/project/${projectId}/download/zip`;
   const fetchZip = () =>
     page.evaluate(async ({ url }) => {
@@ -99,21 +100,33 @@ export async function pullProject({ page, cap, deployment, projectId, mirrorDir,
     }, { url: zipUrl });
 
   // The download/zip endpoint is occasionally flaky (transient 500); retry.
+  // --no-zip skips it entirely and goes straight to the socket fallback.
   let zipB64 = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    zipB64 = await fetchZip();
-    if (zipB64 && zipB64.ok) break;
-    log(`ZIP download attempt ${attempt} failed (status ${zipB64 ? zipB64.status : "n/a"})${attempt < 3 ? " — retrying…" : ""}`);
-    if (attempt < 3) await page.waitForTimeout(1500).catch(() => {});
+  if (!noZip) {
+    log("downloading project ZIP…");
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      zipB64 = await fetchZip();
+      if (zipB64 && zipB64.ok) break;
+      log(`ZIP download attempt ${attempt} failed (status ${zipB64 ? zipB64.status : "n/a"})${attempt < 3 ? " — retrying…" : ""}`);
+      if (attempt < 3) await page.waitForTimeout(1500).catch(() => {});
+    }
   }
-  if (!zipB64 || !zipB64.ok) {
-    throw new Error(`ZIP download failed after 3 attempts (status ${zipB64 ? zipB64.status : "n/a"}) at ${zipUrl}`);
+  let fileEntries;
+  if (zipB64 && zipB64.ok) {
+    log(`ZIP ${(zipB64.bytes / 1024).toFixed(0)} KB downloaded (${Date.now() - t0}ms); extracting…`);
+    fileEntries = stripCommonRoot(unzip(Buffer.from(zipB64.b64, "base64"))).filter((e) => !e.dir);
+  } else {
+    // ZIP endpoint down (it sometimes 500s under load) or skipped. Fall back to
+    // fetching content per entity over the socket — the same path review/watch
+    // use — so a flaky ZIP never hard-fails the pull.
+    log(noZip
+      ? "fetching content per-document over the socket (--no-zip)…"
+      : `ZIP download failed (status ${zipB64 ? zipB64.status : "n/a"}) — falling back to per-document fetch over the socket…`);
+    fileEntries = await fetchEntriesViaSocket(page, deployment, projectId, docs, files, log);
+    if (!fileEntries.length && docs.length + files.length > 0) {
+      throw new Error(`could not fetch content via ZIP (status ${zipB64 ? zipB64.status : "n/a"}) or the socket — the session may be expired; re-run \`link\`.`);
+    }
   }
-  log(`ZIP ${(zipB64.bytes / 1024).toFixed(0)} KB downloaded (${Date.now() - t0}ms); extracting…`);
-
-  let entries = unzip(Buffer.from(zipB64.b64, "base64"));
-  entries = stripCommonRoot(entries);
-  let fileEntries = entries.filter((e) => !e.dir);
   const byName = new Map(fileEntries.map((e) => [e.name, e.data]));
 
   // .overleafignore: drop ignored paths from the sync (both report + reconcile).
@@ -251,6 +264,29 @@ export async function joinOneDoc(page, docId, { timeout = 8000 } = {}) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Fallback content fetch when the ZIP endpoint is down: text docs via joinDoc
+ * (the injected socket hook), binaries via /project/{id}/file/{id}. Returns the
+ * same shape as the ZIP file entries: [{ name, data:Buffer }].
+ */
+async function fetchEntriesViaSocket(page, deployment, projectId, docs, files, log) {
+  const entries = [];
+  let okDocs = 0, okBins = 0, failed = 0;
+  for (const d of docs) {
+    const r = await joinOneDoc(page, d.docId);
+    if (r && Array.isArray(r.lines)) { entries.push({ name: d.path, data: Buffer.from(docText(r.lines), "utf8") }); okDocs++; }
+    else { failed++; log(`  fallback: ${d.path} — joinDoc returned no content`); }
+  }
+  for (const f of files) {
+    if (!f.id) { failed++; continue; }
+    const b64 = await downloadFileB64(page, deployment, projectId, f.id);
+    if (b64 != null) { entries.push({ name: f.path, data: Buffer.from(b64, "base64") }); okBins++; }
+    else { failed++; log(`  fallback: ${f.path} — file download failed`); }
+  }
+  log(`socket fallback: ${okDocs} doc(s) + ${okBins} binary file(s)${failed ? `, ${failed} failed` : ""}`);
+  return entries;
 }
 
 /** Fall back to matching a tree path against a ZIP entry by path suffix. */
