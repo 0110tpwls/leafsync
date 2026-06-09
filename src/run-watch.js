@@ -120,8 +120,10 @@ export async function runForegroundWatch({ root, cfg, args }) {
   const entries = docs
     .filter((d) => rmap.get(d.docId) && Array.isArray(rmap.get(d.docId).lines))
     .map((d) => ({ name: d.path, data: Buffer.from(docText(rmap.get(d.docId).lines), "utf8") }));
-  const { result: sync, manifest: nextManifest } = await reconcile({ mirrorDir, entries, manifest, force: args.force, log });
+  const { result: sync, manifest: nextManifest } = await reconcile({ mirrorDir, entries, manifest, force: args.force, log, stateDir: sd });
   await writeManifest(sd, nextManifest);
+  if (sync.merged.length) log(`auto-merged ${sync.merged.length} file(s) (both sides changed, no overlap)`);
+  if (sync.conflicts.length) log(`⚠ ${sync.conflicts.length} conflict(s) — run \`leafsync resolve\`; OL→local paused for them`);
   const divergedPaths = new Set([...sync.kept, ...sync.conflicts.map((c) => c.path)]);
   // Un-flag FALSE divergence whose only difference is trailing whitespace: the
   // ZIP-written mirror often ends with a "\n" that joinDoc's canonical text

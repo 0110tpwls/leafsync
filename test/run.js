@@ -12,6 +12,7 @@ import { unzip, stripCommonRoot } from "../src/unzip.js";
 import { reconcile, sha256 } from "../src/reconcile.js";
 import { ensureParentFolder } from "../src/tree.js";
 import { parseDaemonCommand } from "../src/daemons.js";
+import { merge3, MARK_START, MARK_MID, MARK_END } from "../src/merge.js";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -357,5 +358,109 @@ t("EditEchoGuard.shouldDropByOp drops our submitted op without a docId", () => {
   assert.equal(g.shouldDropByOp([{ i: "hi", p: 0 }]), false); // consumed
   assert.equal(g.shouldDropByOp([{ i: "other", p: 0 }]), false);
 });
+
+// --- merge3: git-style 3-way line merge ---
+const J = (s) => s.join("\n");
+t("merge3: only local changed -> take local, clean", () => {
+  const r = merge3(J(["a", "b", "c"]), J(["a", "X", "c"]), J(["a", "b", "c"]));
+  assert.equal(r.clean, true);
+  assert.equal(r.text, J(["a", "X", "c"]));
+});
+t("merge3: only incoming changed -> take incoming, clean", () => {
+  const r = merge3(J(["a", "b", "c"]), J(["a", "b", "c"]), J(["a", "Y", "c"]));
+  assert.equal(r.clean, true);
+  assert.equal(r.text, J(["a", "Y", "c"]));
+});
+t("merge3: non-overlapping edits auto-merge cleanly", () => {
+  // local edits line 1, incoming edits line 3 — both should land
+  const r = merge3(J(["a", "b", "c"]), J(["A", "b", "c"]), J(["a", "b", "C"]));
+  assert.equal(r.clean, true);
+  assert.equal(r.text, J(["A", "b", "C"]));
+});
+t("merge3: same region changed differently -> conflict markers", () => {
+  const r = merge3(J(["a", "b", "c"]), J(["a", "X", "c"]), J(["a", "Y", "c"]));
+  assert.equal(r.clean, false);
+  assert.equal(r.conflicts.length, 1);
+  assert.deepEqual(r.conflicts[0], { local: ["X"], incoming: ["Y"] });
+  assert.ok(r.text.includes(MARK_START) && r.text.includes(MARK_MID) && r.text.includes(MARK_END));
+  // local side appears before the divider, incoming after
+  assert.ok(r.text.indexOf("X") < r.text.indexOf(MARK_MID));
+  assert.ok(r.text.indexOf("Y") > r.text.indexOf(MARK_MID));
+});
+t("merge3: identical change on both sides -> clean (no conflict)", () => {
+  const r = merge3(J(["a", "b"]), J(["a", "Z"]), J(["a", "Z"]));
+  assert.equal(r.clean, true);
+  assert.equal(r.text, J(["a", "Z"]));
+});
+t("merge3: trailing-newline-only difference is not a conflict", () => {
+  const r = merge3("a\nb", "a\nb\n", "a\nb");
+  assert.equal(r.clean, true);
+});
+
+// --- reconcile 3-way (base shadow) + resolve + stash (full git-like flow) ---
+await (async () => {
+  const { reconcile } = await import("../src/reconcile.js");
+  const { listConflicts, resolveAll, stashSave, stashPop } = await import("../src/resolve.js");
+  const E = (name, s) => ({ name, data: Buffer.from(s) });
+  const mk = () => mkdtempSync(path.join(os.tmpdir(), "olm-"));
+  // establish a baseline so .overleaf/base + manifest exist
+  const setup = async (baseText) => {
+    const dir = mk(); const sd = path.join(dir, ".overleaf");
+    const r = await reconcile({ mirrorDir: dir, entries: [E("f.tex", baseText)], manifest: {}, stateDir: sd });
+    return { dir, sd, manifest: r.manifest };
+  };
+
+  // auto-merge: local edits one line, Overleaf another -> both land, clean
+  {
+    const { dir, sd, manifest } = await setup("L1\nL2\nL3");
+    writeFileSync(path.join(dir, "f.tex"), "L1\nLOCAL\nL3");
+    const r = await reconcile({ mirrorDir: dir, entries: [E("f.tex", "OL1\nL2\nL3")], manifest, stateDir: sd });
+    t("reconcile: 3-way auto-merge of non-overlapping edits", () => {
+      assert.deepEqual(r.result.merged, ["f.tex"]);
+      assert.equal(readFileSync(path.join(dir, "f.tex"), "utf8"), "OL1\nLOCAL\nL3");
+    });
+  }
+
+  // true conflict: both edit the SAME line differently
+  {
+    const { dir, sd, manifest } = await setup("L1\nL2\nL3");
+    writeFileSync(path.join(dir, "f.tex"), "L1\nMINE\nL3");
+    const r = await reconcile({ mirrorDir: dir, entries: [E("f.tex", "L1\nTHEIRS\nL3")], manifest, stateDir: sd });
+    const cj = await listConflicts(sd);
+    const markered = readFileSync(path.join(sd, "conflicts", "f.tex"), "utf8");
+    const theirs = readFileSync(path.join(sd, "conflicts", "f.tex.theirs"), "utf8");
+    t("reconcile: true conflict keeps local live + writes markered sidecar + conflicts.json", () => {
+      assert.equal(r.result.conflicts.length, 1);
+      assert.equal(readFileSync(path.join(dir, "f.tex"), "utf8"), "L1\nMINE\nL3"); // live keeps YOURS
+      assert.deepEqual(cj.map((c) => c.path), ["f.tex"]);
+      assert.ok(markered.includes("MINE") && markered.includes("THEIRS") && markered.includes("<<<<<<<"));
+      assert.equal(theirs, "L1\nTHEIRS\nL3");
+    });
+    // resolve --theirs clears it
+    const res = await resolveAll(sd, dir, "theirs");
+    const after = await listConflicts(sd);
+    t("resolve --theirs takes Overleaf's version and clears the conflict", () => {
+      assert.deepEqual(res.resolved, ["f.tex"]);
+      assert.equal(readFileSync(path.join(dir, "f.tex"), "utf8"), "L1\nTHEIRS\nL3");
+      assert.equal(after.length, 0);
+    });
+  }
+
+  // stash: save local, revert to base, then pop merges onto a (changed) pull
+  {
+    const { dir, sd, manifest } = await setup("B1\nB2\nB3");
+    writeFileSync(path.join(dir, "f.tex"), "B1\nMINE\nB3");
+    const saved = await stashSave(sd, dir, manifest);
+    const reverted = readFileSync(path.join(dir, "f.tex"), "utf8");
+    writeFileSync(path.join(dir, "f.tex"), "OL1\nB2\nB3"); // simulate a pull that changed another line
+    const pop = await stashPop(sd, dir);
+    t("stash + pop: shelves local, reverts to base, re-applies via 3-way merge", () => {
+      assert.deepEqual(saved, ["f.tex"]);
+      assert.equal(reverted, "B1\nB2\nB3"); // reverted to base after stash
+      assert.deepEqual(pop.popped, ["f.tex"]);
+      assert.equal(readFileSync(path.join(dir, "f.tex"), "utf8"), "OL1\nMINE\nB3"); // both changes
+    });
+  }
+})();
 
 console.log(`\n${pass} tests passed.`);

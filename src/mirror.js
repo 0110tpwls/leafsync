@@ -121,11 +121,12 @@ export async function pullProject({ page, cap, deployment, projectId, mirrorDir,
   const sd = stateDir || path.join(mirrorDir, ".overleaf");
   const manifest = await readManifest(sd);
   const { result: sync, manifest: nextManifest } = await reconcile({
-    mirrorDir, entries: fileEntries, manifest, force, log,
+    mirrorDir, entries: fileEntries, manifest, force, log, stateDir: sd,
   });
   await writeManifest(sd, nextManifest);
   log(`mirror: ${summarize(sync)}`);
-  for (const c of sync.conflicts) log(`  ⚠ conflict: ${c.path} (changed locally AND on Overleaf) → kept local; Overleaf version at ${path.basename(c.incoming)}`);
+  if (sync.merged.length) log(`  auto-merged ${sync.merged.length} file(s) (both sides changed, no overlap): ${sync.merged.slice(0, 5).join(", ")}`);
+  for (const c of sync.conflicts) log(`  ⚠ conflict: ${c.path} (changed locally AND on Overleaf) → kept local; ${c.conflictFile ? "markers in .overleaf/conflicts/, run `leafsync resolve`" : "Overleaf version at " + path.basename(c.incoming)}`);
   if (sync.kept.length) log(`  kept ${sync.kept.length} local edit(s): ${sync.kept.slice(0, 5).join(", ")}${sync.kept.length > 5 ? "…" : ""}`);
 
   // Build text-doc results (feed the comment report). Match ZIP entries to the

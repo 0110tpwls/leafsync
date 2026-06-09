@@ -22,8 +22,15 @@ const HELP = `leafsync — two-way sync + comment mirror for Overleaf (write-bac
 Usage:
   leafsync link <project-url>     one-time login; record project + session
   leafsync pull [--force]         mirror Overleaf -> local + refresh comments
-                                   (safe by default: keeps local edits, flags
-                                    conflicts; --force overwrites local)
+                                   (safe: 3-way auto-merge; true conflicts kept
+                                    for resolve; --force takes Overleaf's, drops
+                                    local)
+  leafsync resolve [--ours|--theirs|--merged]
+                                  resolve merge conflicts. no flag = interactive
+                                  (per file: ours / theirs / edit); a flag
+                                  resolves ALL the same way
+  leafsync stash                  shelve local changes + revert to base (pull cleanly)
+  leafsync stash pop              re-apply shelved changes (3-way merge)
   leafsync comments               refresh the local comment report only
   leafsync watch [opts]           live two-way sync (loop-guarded)
   leafsync status                 daemon state / last sync
@@ -54,7 +61,7 @@ function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--background" || a === "--headful" || a === "--force" || a === "--push" || a === "--ls" || a === "--rm") args[a.slice(2)] = true;
+    if (a === "--background" || a === "--headful" || a === "--force" || a === "--push" || a === "--ls" || a === "--rm" || a === "--ours" || a === "--theirs" || a === "--merged") args[a.slice(2)] = true;
     else if (a === "--debug-frames") args.debugFrames = true;
     else if (a === "--verbose" || a === "-v") args.verbose = true;
     else if (a === "--interval") args.interval = Number(argv[++i]);
@@ -317,6 +324,51 @@ async function removeDaemons(selectors) {
   }
 }
 
+async function cmdResolve(root, args) {
+  const cfg = await requireConfig(root);
+  const mirrorDir = path.resolve(root, args.mirror || cfg.mirrorDir || ".");
+  const sd = stateDir(root);
+  const { listConflicts, resolveAll, interactiveResolve } = await import("./resolve.js");
+  const { readManifest, writeManifest } = await import("./reconcile.js");
+  const conflicts = await listConflicts(sd);
+  if (!conflicts.length) return console.log("no conflicts to resolve.");
+  const applyPatch = async (patch) => { const m = await readManifest(sd); Object.assign(m, patch); await writeManifest(sd, m); };
+
+  const choice = args.ours ? "ours" : args.theirs ? "theirs" : args.merged ? "merged" : null;
+  if (choice) {
+    const { resolved, patch } = await resolveAll(sd, mirrorDir, choice);
+    await applyPatch(patch);
+    return console.log(`resolved ${resolved.length} conflict(s) as ${choice}: ${resolved.join(", ")}`);
+  }
+  if (!process.stdin.isTTY) {
+    console.log(`${conflicts.length} unresolved conflict(s): ${conflicts.map((c) => c.path).join(", ")}`);
+    console.log("run `leafsync resolve` in an interactive terminal, or pass --ours / --theirs / --merged.");
+    return;
+  }
+  console.log(`${conflicts.length} conflict(s). Per file — (o)urs keeps yours, (t)heirs takes Overleaf's, (e)dit opens the marked-up file, (s)kip.`);
+  const { resolved, patch, skipped } = await interactiveResolve(sd, mirrorDir, {});
+  await applyPatch(patch);
+  console.log(`\nresolved ${resolved.length}${skipped.length ? `, skipped ${skipped.length} (still conflicted)` : ""}.`);
+}
+
+async function cmdStash(root, args) {
+  const cfg = await requireConfig(root);
+  const mirrorDir = path.resolve(root, args.mirror || cfg.mirrorDir || ".");
+  const sd = stateDir(root);
+  const { stashSave, stashPop } = await import("./resolve.js");
+  const { readManifest } = await import("./reconcile.js");
+  const sub = args._[1];
+  if (sub === "pop") {
+    const { popped, conflicts } = await stashPop(sd, mirrorDir);
+    return console.log(`stash pop: ${popped.length} re-applied${conflicts.length ? `, ${conflicts.length} conflict(s) — run \`leafsync resolve\`` : ""}.`);
+  }
+  if (sub && sub !== "save") throw new Error(`unknown stash subcommand: ${sub} (use \`stash\` or \`stash pop\`)`);
+  const saved = await stashSave(sd, mirrorDir, await readManifest(sd));
+  console.log(saved.length
+    ? `stashed ${saved.length} locally-modified file(s): ${saved.join(", ")}.\nNow \`pull\`, then \`stash pop\` to re-apply.`
+    : "nothing to stash (no local modifications vs base).");
+}
+
 async function cmdUnlink(root) {
   await stopDaemon(root).catch(() => {});
   await clearLock(root).catch(() => {});
@@ -338,6 +390,8 @@ async function main() {
     case "pull": return cmdPull(root, args);
     case "comments": return cmdComments(root, args);
     case "watch": return cmdWatch(root, args);
+    case "resolve": return cmdResolve(root, args);
+    case "stash": return cmdStash(root, args);
     case "status": return cmdStatus(root);
     case "stop": return cmdStop(root, args);
     case "unlink": return cmdUnlink(root);

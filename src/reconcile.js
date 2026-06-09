@@ -1,26 +1,27 @@
-// reconcile.js — make `pull` safe: never silently overwrite local edits.
+// reconcile.js — make `pull` safe and git-like: never silently overwrite local.
 //
-// A plain ZIP extract is `cp -f`: it clobbers any local change you hadn't
-// pushed. Instead we keep a BASELINE manifest (sha256 per file, = the Overleaf
-// content at the last pull) and do a 3-way reconcile per file, the way git does:
+// Three inputs per file (git's merge inputs):
+//   base     = .overleaf/base/<path>  (content at the last sync — the merge base)
+//   local    = the file on disk        (ours)
+//   incoming = the ZIP/joinDoc content (theirs = Overleaf now)
 //
-//   base = manifest[path]   (last-pulled Overleaf hash)
-//   local = hash(file on disk)
-//   incoming = hash(ZIP entry)
+//   no local file                 -> write   (new)
+//   local == incoming             -> nothing (in sync)
+//   local == base                 -> write   (fast-forward; you didn't touch it)
+//   incoming == base              -> KEEP local (your edit; remote unchanged)
+//   all three differ (text)       -> 3-WAY MERGE: auto-merge if the changes don't
+//                                    overlap; otherwise keep local live + record a
+//                                    CONFLICT (git-style markers in .overleaf/).
+//   all three differ (binary/no base) -> keep local, stash incoming sidecar
 //
-//   no local file              -> write   (new)
-//   local == incoming          -> nothing (already in sync)
-//   local == base              -> write   (fast-forward; you didn't touch it)
-//   local != base, incoming==base -> KEEP local (your edit; remote unchanged)
-//   local != base, incoming!=base -> CONFLICT: keep local, stash incoming as
-//                                    <file>.overleaf-incoming, leave base
-//
-// `--force` restores the old clobber-everything behaviour. Stdlib only.
+// `--force` restores clobber-everything. The base shadow (`.overleaf/base/`) is
+// what lets us auto-merge and stash like git. Stdlib only.
 
 import { createHash } from "node:crypto";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { merge3, MARK_START, MARK_MID, MARK_END } from "./merge.js";
 
 export function sha256(buf) {
   return createHash("sha256").update(buf).digest("hex");
@@ -40,63 +41,146 @@ export async function writeManifest(stateDir, manifest) {
   await writeFile(path.join(stateDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
 }
 
-/**
- * Reconcile incoming ZIP entries against the local tree + baseline manifest.
- * @param entries [{ name, data:Buffer }] (files only, no dirs)
- * @returns { result, manifest } — result groups paths by outcome; manifest is
- *          the updated baseline to persist.
- */
-export async function reconcile({ mirrorDir, entries, manifest, force = false, log = () => {} }) {
-  const result = { created: [], updated: [], inSync: [], kept: [], conflicts: [] };
+// --- base shadow (merge base) + conflict artifacts ---
+export function baseDir(stateDir) { return path.join(stateDir, "base"); }
+export function conflictsDir(stateDir) { return path.join(stateDir, "conflicts"); }
+
+export async function readBaseContent(stateDir, name) {
+  try { return await readFile(path.join(baseDir(stateDir), name)); } catch { return null; }
+}
+export async function writeBaseContent(stateDir, name, buf) {
+  const dest = path.join(baseDir(stateDir), name);
+  await mkdir(path.dirname(dest), { recursive: true });
+  await writeFile(dest, buf);
+}
+function isBinaryBuf(buf) {
+  return Buffer.isBuffer(buf) && buf.includes(0); // NUL byte -> treat as binary (don't merge)
+}
+
+/** Reconcile incoming entries against local + the base shadow. */
+export async function reconcile({ mirrorDir, entries, manifest, force = false, log = () => {}, stateDir = null }) {
+  const result = { created: [], updated: [], inSync: [], kept: [], merged: [], conflicts: [] };
   const next = { ...manifest };
+  const conflictRecords = []; // { path } — full state lives in .overleaf/conflicts/
 
   for (const e of entries) {
     const dest = path.join(mirrorDir, e.name);
     const incoming = e.data;
     const incomingHash = sha256(incoming);
     const exists = existsSync(dest);
+    const recordBase = async () => { if (stateDir) await writeBaseContent(stateDir, e.name, incoming); };
 
     if (!exists) {
       await mkdir(path.dirname(dest), { recursive: true });
       await writeFile(dest, incoming);
-      next[e.name] = incomingHash;
+      next[e.name] = incomingHash; await recordBase();
       result.created.push(e.name);
       continue;
     }
 
-    const localHash = sha256(await readFile(dest));
+    const localBuf = await readFile(dest);
+    const localHash = sha256(localBuf);
     const baseHash = manifest[e.name];
 
     if (force) {
-      await writeFile(dest, incoming);
-      next[e.name] = incomingHash;
-      if (localHash !== incomingHash) result.updated.push(e.name);
-      else result.inSync.push(e.name);
+      await writeFile(dest, incoming); next[e.name] = incomingHash; await recordBase();
+      (localHash !== incomingHash ? result.updated : result.inSync).push(e.name);
       continue;
     }
 
     if (localHash === incomingHash) {
-      next[e.name] = incomingHash; // identical content; record baseline
-      result.inSync.push(e.name);
+      next[e.name] = incomingHash; await recordBase(); result.inSync.push(e.name);
     } else if (localHash === baseHash) {
-      // Local untouched since last pull -> fast-forward to Overleaf.
-      await writeFile(dest, incoming);
-      next[e.name] = incomingHash;
-      result.updated.push(e.name);
+      await writeFile(dest, incoming); next[e.name] = incomingHash; await recordBase(); result.updated.push(e.name);
     } else if (baseHash !== undefined && incomingHash === baseHash) {
-      // Local edited, Overleaf unchanged -> keep the local edit (pending push).
-      result.kept.push(e.name);
-      // baseline stays baseHash
+      result.kept.push(e.name); // local edit, Overleaf unchanged -> keep local (pending push)
     } else {
-      // Changed on BOTH sides (or no baseline) -> conflict. Never destroy local.
-      const side = dest + ".overleaf-incoming";
-      await writeFile(side, incoming);
-      result.conflicts.push({ path: e.name, incoming: side });
-      // leave baseline as-is so the conflict keeps surfacing until resolved
+      // changed on BOTH sides -> try a real 3-way merge.
+      const baseContent = stateDir ? await readBaseContent(stateDir, e.name) : null;
+      const mergeable = baseContent != null && !isBinaryBuf(incoming) && !isBinaryBuf(localBuf);
+      if (mergeable) {
+        const m = merge3(baseContent.toString("utf8"), localBuf.toString("utf8"), incoming.toString("utf8"));
+        if (m.clean) {
+          // auto-merged: local now carries both sides' changes -> base advances to
+          // Overleaf's version, and the merged result is a pending push.
+          await writeFile(dest, m.text, "utf8");
+          next[e.name] = sha256(Buffer.from(m.text, "utf8"));
+          await recordBase();
+          result.merged.push(e.name);
+          continue;
+        }
+        // true conflict: keep LOCAL in the live file (so it still compiles and the
+        // markers never get pushed); write the markered version + theirs to
+        // .overleaf/conflicts/ for review/resolve. Baseline stays until resolved.
+        await writeConflictFiles(stateDir, e.name, m.text, incoming);
+        conflictRecords.push({ path: e.name });
+        result.conflicts.push({ path: e.name, conflictFile: path.join(conflictsDir(stateDir), e.name) });
+      } else {
+        const side = dest + ".overleaf-incoming";
+        await writeFile(side, incoming);
+        result.conflicts.push({ path: e.name, incoming: side });
+      }
     }
   }
 
+  if (stateDir) await writeConflictReport(stateDir, conflictRecords);
   return { result, manifest: next };
+}
+
+export async function writeConflictFiles(stateDir, name, markeredText, incomingBuf) {
+  const markered = path.join(conflictsDir(stateDir), name);
+  await mkdir(path.dirname(markered), { recursive: true });
+  await writeFile(markered, markeredText, "utf8");
+  await writeFile(markered + ".theirs", incomingBuf); // Overleaf's version, for `resolve --theirs`
+}
+
+/** Rewrite .overleaf/conflicts.json + CONFLICTS.md from the current conflict set. */
+export async function writeConflictReport(stateDir, records) {
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(path.join(stateDir, "conflicts.json"), JSON.stringify(records, null, 2) + "\n");
+  if (!records.length) {
+    await rm(path.join(stateDir, "CONFLICTS.md"), { force: true });
+    return;
+  }
+  const lines = [];
+  lines.push("# Overleaf sync conflicts");
+  lines.push("");
+  lines.push(`${records.length} file(s) changed on BOTH your machine and Overleaf and could not auto-merge.`);
+  lines.push("");
+  lines.push("Resolve them with:");
+  lines.push("```");
+  lines.push("leafsync resolve            # interactive: ours / theirs / edit, per file");
+  lines.push("```");
+  lines.push("`ours` keeps your local version, `theirs` takes Overleaf's, `edit` opens the");
+  lines.push("marked-up file below so you can hand-merge. Conflict regions are wrapped in");
+  lines.push("`<<<<<<<` / `=======` / `>>>>>>>` markers (git style).");
+  lines.push("");
+  for (const r of records) {
+    const markered = path.join(conflictsDir(stateDir), r.path);
+    lines.push(`## ${r.path}`);
+    lines.push("");
+    lines.push("marked-up file: `" + path.relative(path.dirname(stateDir), markered) + "`");
+    lines.push("");
+    let preview = "";
+    try { preview = await previewConflicts(markered); } catch { /* ignore */ }
+    if (preview) { lines.push("```"); lines.push(preview); lines.push("```"); lines.push(""); }
+  }
+  await writeFile(path.join(stateDir, "CONFLICTS.md"), lines.join("\n") + "\n");
+}
+
+/** Extract just the conflict hunks (with markers + a little context) for the report. */
+async function previewConflicts(markeredPath) {
+  const text = await readFile(markeredPath, "utf8");
+  const lines = text.split("\n");
+  const out = [];
+  let inHunk = false, shown = 0;
+  for (let i = 0; i < lines.length && shown < 3; i++) {
+    const l = lines[i];
+    if (l.startsWith(MARK_START)) { inHunk = true; }
+    if (inHunk) out.push(l);
+    if (l.startsWith(MARK_END)) { inHunk = false; shown++; out.push("…"); }
+  }
+  return out.join("\n").trim();
 }
 
 /** One-line, user-facing summary of a reconcile result. */
@@ -104,6 +188,6 @@ export function summarize(result) {
   const n = (a) => a.length;
   return (
     `${n(result.created)} new, ${n(result.updated)} updated, ${n(result.inSync)} unchanged, ` +
-    `${n(result.kept)} kept (local edits), ${n(result.conflicts)} conflict(s)`
+    `${n(result.merged)} auto-merged, ${n(result.kept)} kept (local edits), ${n(result.conflicts)} conflict(s)`
   );
 }
